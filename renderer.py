@@ -17,12 +17,12 @@ DOOR_OUTLINE = (0, 0, 0)
 GRAY = (160, 160, 160)
 
 
-def _compute_offset(dungeon):
-    """Compute the row/col offset between the cells array and map coordinates.
+# ---------------------------------------------------------------------------
+# Coordinate helpers
+# ---------------------------------------------------------------------------
 
-    The cells array may be larger than n_rows x n_cols, padded equally on all
-    sides.  Map-coordinate (r, c) corresponds to cells[r + off][c + off].
-    """
+def _compute_offset(dungeon):
+    """Compute the row/col offset between the cells array and map coordinates."""
     cell_data = dungeon["cells"]
     n_rows = dungeon["settings"]["n_rows"]
     n_cols = dungeon["settings"]["n_cols"]
@@ -40,166 +40,9 @@ def _cell(cell_data, map_row, map_col, row_off, col_off):
     return 0
 
 
-def render_map(dungeon, cell_size=None, gm_mode=True):
-    """Render the dungeon map as a PIL Image."""
-    settings = dungeon["settings"]
-    if cell_size is None:
-        cell_size = settings["cell_size"]
-
-    cell_data = dungeon["cells"]
-    n_rows = settings["n_rows"]
-    n_cols = settings["n_cols"]
-    rooms = dungeon.get("rooms", [])
-    stairs = dungeon.get("stairs", [])
-    row_off, col_off = _compute_offset(dungeon)
-
-    width = n_cols * cell_size + 1
-    height = n_rows * cell_size + 1
-
-    img = Image.new("RGB", (width, height), BLACK)
-    draw = ImageDraw.Draw(img)
-
-    # Build door orientation map from room data (more reliable than neighbor checks)
-    door_orient_map = _build_door_orient_map(dungeon)
-
-    # Pass 1: Fill open cells with white
-    _fill_cells(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off)
-
-    # Pass 2: Draw polygon/circle rooms as filled geometric shapes
-    _draw_shaped_rooms(draw, img, rooms, cell_size)
-
-    # Pass 3: Draw grid lines on top of fills
-    draw = ImageDraw.Draw(img)  # refresh after paste operations
-    _draw_grid(draw, img, cell_data, n_rows, n_cols, cell_size, row_off, col_off)
-
-    # Pass 4: Draw doors
-    _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
-                door_orient_map)
-
-    # Pass 5: Draw stairs
-    _draw_stairs(draw, stairs, cell_data, cell_size, row_off, col_off)
-
-    # Pass 6: Draw labels (GM mode only)
-    if gm_mode:
-        _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off)
-
-    return img
-
-
-def _build_door_orient_map(dungeon):
-    """Build a map of (row, col) -> orientation from room door data.
-
-    This is more reliable than checking cell neighbors, which can fail when
-    all neighbors are walls.
-    """
-    orient_map = {}
-    rooms = dungeon.get("rooms", [])
-    for room in rooms:
-        if room is None:
-            continue
-        doors = room.get("doors", {})
-        for direction, door_list in doors.items():
-            # north/south doors sit on a horizontal wall (east-west)
-            # east/west doors sit on a vertical wall (north-south)
-            orient = "horizontal" if direction in ("north", "south") else "vertical"
-            for door in door_list:
-                orient_map[(door["row"], door["col"])] = orient
-    return orient_map
-
-
-def _fill_cells(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off):
-    """Fill all open cells with white."""
-    for row in range(n_rows):
-        for col in range(n_cols):
-            if C.is_open(_cell(cell_data, row, col, row_off, col_off)):
-                x = col * cell_size
-                y = row * cell_size
-                draw.rectangle([x, y, x + cell_size, y + cell_size], fill=WHITE)
-
-
-def _draw_shaped_rooms(draw, img, rooms, cell_size):
-    """Draw polygon and circle rooms as filled geometric shapes.
-
-    Shaped rooms are drawn directly from their geometric definition, not from
-    cell data, because the cell data may only contain a subset of the room area.
-    """
-    for room in rooms:
-        if room is None:
-            continue
-
-        shape = room.get("shape")
-        if shape not in ("polygon", "circle"):
-            continue
-
-        west, east = room["west"], room["east"]
-        north, south = room["north"], room["south"]
-
-        x1 = west * cell_size
-        y1 = north * cell_size
-        x2 = (east + 1) * cell_size
-        y2 = (south + 1) * cell_size
-
-        if shape == "polygon":
-            vertices = room_polygon_vertices(room, cell_size)
-            if vertices:
-                draw.polygon(vertices, fill=WHITE)
-        elif shape == "circle":
-            cx, cy, radius = room_circle_params(room, cell_size)
-            draw.ellipse(
-                [cx - radius, cy - radius, cx + radius, cy + radius],
-                fill=WHITE,
-            )
-
-
-def _draw_grid(draw, img, cell_data, n_rows, n_cols, cell_size, row_off, col_off):
-    """Draw grid lines over open cells. Must be called after all fills."""
-    for row in range(n_rows):
-        for col in range(n_cols):
-            x = col * cell_size
-            y = row * cell_size
-
-            # Check if this pixel is white (open area) - works for both
-            # cell-based fills and geometric shape fills
-            px_x = min(x + cell_size // 2, img.width - 1)
-            px_y = min(y + cell_size // 2, img.height - 1)
-            if img.getpixel((px_x, px_y)) == BLACK:
-                continue
-
-            cell_right = _cell(cell_data, row, col + 1, row_off, col_off)
-            cell_below = _cell(cell_data, row + 1, col, row_off, col_off)
-            cell_left = _cell(cell_data, row, col - 1, row_off, col_off)
-            cell_above = _cell(cell_data, row - 1, col, row_off, col_off)
-
-            # Check if neighbor pixels are also white (for shaped rooms)
-            def _is_open_pixel(r, c):
-                px = min(c * cell_size + cell_size // 2, img.width - 1)
-                py = min(r * cell_size + cell_size // 2, img.height - 1)
-                if px < 0 or py < 0:
-                    return False
-                return img.getpixel((px, py)) != BLACK
-
-            # Right edge
-            rx = x + cell_size
-            if col + 1 < n_cols and _is_open_pixel(row, col + 1):
-                draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
-            else:
-                draw.line([(rx, y), (rx, y + cell_size)], fill=WALL_COLOR)
-
-            # Bottom edge
-            by = y + cell_size
-            if row + 1 < n_rows and _is_open_pixel(row + 1, col):
-                draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
-            else:
-                draw.line([(x, by), (x + cell_size, by)], fill=WALL_COLOR)
-
-            # Left edge (wall boundary)
-            if col == 0 or not _is_open_pixel(row, col - 1):
-                draw.line([(x, y), (x, y + cell_size)], fill=WALL_COLOR)
-
-            # Top edge (wall boundary)
-            if row == 0 or not _is_open_pixel(row - 1, col):
-                draw.line([(x, y), (x + cell_size, y)], fill=WALL_COLOR)
-
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
 
 def room_polygon_vertices(room, cell_size):
     """Compute polygon vertices for a shaped room."""
@@ -244,6 +87,284 @@ def room_circle_params(room, cell_size):
     return cx, cy, radius
 
 
+def _build_polymorph_set(rooms):
+    """Return a set of room IDs that are polymorph (polygon or circle)."""
+    ids = set()
+    for room in rooms:
+        if room is None:
+            continue
+        if room.get("shape") in ("polygon", "circle"):
+            ids.add(int(room["id"]))
+    return ids
+
+
+def _build_door_orient_map(dungeon):
+    """Build a map of (row, col) -> orientation from room door data."""
+    orient_map = {}
+    for room in dungeon.get("rooms", []):
+        if room is None:
+            continue
+        for direction, door_list in room.get("doors", {}).items():
+            orient = "horizontal" if direction in ("north", "south") else "vertical"
+            for door in door_list:
+                orient_map[(door["row"], door["col"])] = orient
+    return orient_map
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def render_map(dungeon, cell_size=None, gm_mode=True):
+    """Render the dungeon map as a PIL Image.
+
+    Rendering pipeline:
+      Phase 1 — Rooms: fill square rooms from cells; draw geometric shapes
+                for polymorph rooms.
+      Phase 2 — Corridors: fill corridor cells white. Where a corridor/door
+                cell is adjacent to a room, also fill that room cell white
+                (corridor invasion) so connections are never cut off.
+      Phase 3 — Grid & perimeter: draw gray grid lines between open cells,
+                wall-color lines at open/closed boundaries, and smooth
+                geometric outlines for polymorph rooms.
+      Phase 4 — Doors, stairs, labels.
+    """
+    settings = dungeon["settings"]
+    if cell_size is None:
+        cell_size = settings["cell_size"]
+
+    cell_data = dungeon["cells"]
+    n_rows = settings["n_rows"]
+    n_cols = settings["n_cols"]
+    rooms = dungeon.get("rooms", [])
+    stairs = dungeon.get("stairs", [])
+    row_off, col_off = _compute_offset(dungeon)
+
+    width = n_cols * cell_size + 1
+    height = n_rows * cell_size + 1
+
+    img = Image.new("RGB", (width, height), BLACK)
+    draw = ImageDraw.Draw(img)
+
+    door_orient_map = _build_door_orient_map(dungeon)
+    polymorph_ids = _build_polymorph_set(rooms)
+
+    # Phase 1: Rooms
+    _fill_rooms(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
+                polymorph_ids)
+    _fill_polymorph_rooms(draw, rooms, cell_size)
+
+    # Phase 2: Corridors (with directional invasion into polymorph rooms)
+    _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
+                    col_off, dungeon)
+
+    # Phase 3: Grid lines and polymorph perimeter outlines
+    _draw_grid(draw, img, n_rows, n_cols, cell_size)
+    _draw_polymorph_outlines(draw, rooms, cell_size)
+
+    # Phase 4: Doors, stairs, labels
+    _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
+                door_orient_map)
+    _draw_stairs(draw, stairs, cell_data, cell_size, row_off, col_off)
+    if gm_mode:
+        _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Room fills
+# ---------------------------------------------------------------------------
+
+def _fill_rooms(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
+                polymorph_ids):
+    """Fill square/rectangular room cells white. Skip polymorph rooms."""
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cell = _cell(cell_data, row, col, row_off, col_off)
+            if not C.is_room(cell):
+                continue
+            rid = C.room_id(cell)
+            if rid in polymorph_ids:
+                continue
+            x = col * cell_size
+            y = row * cell_size
+            draw.rectangle([x, y, x + cell_size, y + cell_size], fill=WHITE)
+
+
+def _fill_polymorph_rooms(draw, rooms, cell_size):
+    """Draw polymorph rooms as proper geometric shapes (white fill)."""
+    for room in rooms:
+        if room is None:
+            continue
+        shape = room.get("shape")
+        if shape == "polygon":
+            vertices = room_polygon_vertices(room, cell_size)
+            if vertices:
+                draw.polygon(vertices, fill=WHITE)
+        elif shape == "circle":
+            cx, cy, radius = room_circle_params(room, cell_size)
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                fill=WHITE,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Corridor fills (with invasion)
+# ---------------------------------------------------------------------------
+
+def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
+                    col_off, dungeon):
+    """Fill corridor cells white, then walk into adjacent polymorph rooms.
+
+    When a door connects a corridor to a polymorph room, the corridor's
+    white fill walks in a straight line from the door into the room (in
+    the door's inward direction) until it reaches cells already rendered
+    white by the geometric shape fill. This bridges the gap without
+    spreading laterally around polygon corners.
+    """
+    # Step 1: Fill all corridor cells white
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cell = _cell(cell_data, row, col, row_off, col_off)
+            if C.is_corridor(cell):
+                x = col * cell_size
+                y = row * cell_size
+                draw.rectangle([x, y, x + cell_size, y + cell_size], fill=WHITE)
+
+    # Step 2: For each door into a polymorph room, walk inward filling
+    # room cells until we reach a cell already white from the shape fill.
+    polymorph_ids = _build_polymorph_set(dungeon.get("rooms", []))
+
+    # Direction vectors: door direction -> step into the room
+    inward_step = {
+        "north": (-1, 0),  # door is on north wall, room is to the south...
+        "south": (1, 0),   # wait, door direction = which wall of the room
+        "east": (0, 1),    # the door is on the room's east wall
+        "west": (0, -1),   # the door is on the room's west wall
+    }
+    # Actually: a "north" door is on the room's north wall. The door cell
+    # is OUTSIDE the room (one row north of the room). Walking INTO the
+    # room means going south (+1, 0). Correcting:
+    inward_step = {
+        "north": (1, 0),   # door on north wall → walk south into room
+        "south": (-1, 0),  # door on south wall → walk north into room
+        "east": (0, -1),   # door on east wall → walk west into room
+        "west": (0, 1),    # door on west wall → walk east into room
+    }
+
+    def _is_white(r, c):
+        px = c * cell_size + cell_size // 2
+        py = r * cell_size + cell_size // 2
+        if 0 <= px < img.width and 0 <= py < img.height:
+            return img.getpixel((px, py)) != BLACK
+        return False
+
+    for room in dungeon.get("rooms", []):
+        if room is None:
+            continue
+        rid = int(room["id"])
+        if rid not in polymorph_ids:
+            continue
+
+        for direction, door_list in room.get("doors", {}).items():
+            dr, dc = inward_step[direction]
+            for door in door_list:
+                # Start from the door cell and walk inward
+                r, c = door["row"], door["col"]
+                # Step into the room
+                r, c = r + dr, c + dc
+                while 0 <= r < n_rows and 0 <= c < n_cols:
+                    if _is_white(r, c):
+                        # Reached the geometric fill — done
+                        break
+                    cell = _cell(cell_data, r, c, row_off, col_off)
+                    if not C.is_room(cell):
+                        break
+                    # Fill this gap cell
+                    x = c * cell_size
+                    y = r * cell_size
+                    draw.rectangle(
+                        [x, y, x + cell_size, y + cell_size], fill=WHITE
+                    )
+                    r, c = r + dr, c + dc
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Grid lines and polymorph outlines
+# ---------------------------------------------------------------------------
+
+def _draw_grid(draw, img, n_rows, n_cols, cell_size):
+    """Draw grid lines based on rendered pixel state.
+
+    Gray lines between two open cells, wall-color lines at open/closed edges.
+    """
+    def _pixel_is_open(r, c):
+        """Check if a cell's center pixel is white (rendered as open)."""
+        px = c * cell_size + cell_size // 2
+        py = r * cell_size + cell_size // 2
+        if 0 <= px < img.width and 0 <= py < img.height:
+            return img.getpixel((px, py)) != BLACK
+        return False
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            if not _pixel_is_open(row, col):
+                continue
+
+            x = col * cell_size
+            y = row * cell_size
+
+            # Right edge
+            rx = x + cell_size
+            if col + 1 < n_cols and _pixel_is_open(row, col + 1):
+                draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
+            else:
+                draw.line([(rx, y), (rx, y + cell_size)], fill=WALL_COLOR)
+
+            # Bottom edge
+            by = y + cell_size
+            if row + 1 < n_rows and _pixel_is_open(row + 1, col):
+                draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
+            else:
+                draw.line([(x, by), (x + cell_size, by)], fill=WALL_COLOR)
+
+            # Left edge
+            if col == 0 or not _pixel_is_open(row, col - 1):
+                draw.line([(x, y), (x, y + cell_size)], fill=WALL_COLOR)
+
+            # Top edge
+            if row == 0 or not _pixel_is_open(row - 1, col):
+                draw.line([(x, y), (x + cell_size, y)], fill=WALL_COLOR)
+
+
+def _draw_polymorph_outlines(draw, rooms, cell_size):
+    """Draw smooth geometric outlines for polymorph rooms.
+
+    This overrides the blocky cell-boundary wall lines with proper
+    polygon/circle perimeters.
+    """
+    for room in rooms:
+        if room is None:
+            continue
+        shape = room.get("shape")
+        if shape == "polygon":
+            vertices = room_polygon_vertices(room, cell_size)
+            if vertices:
+                draw.polygon(vertices, outline=WALL_COLOR)
+        elif shape == "circle":
+            cx, cy, radius = room_circle_params(room, cell_size)
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                outline=WALL_COLOR,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Doors
+# ---------------------------------------------------------------------------
+
 def _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
                 door_orient_map):
     """Draw door symbols on the map."""
@@ -257,7 +378,6 @@ def _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
             y = row * cell_size
             dt = C.door_type(cell)
 
-            # Use precomputed orientation from room data, fall back to neighbor check
             orient = door_orient_map.get((row, col))
             if orient is None:
                 orient = _orient_from_neighbors(cell_data, row, col, row_off, col_off)
@@ -297,7 +417,6 @@ def _draw_door_symbol(draw, x, y, cell_size, orient):
     lw = max(1, cell_size // 5)
 
     if orient == "vertical":
-        # Wall runs north-south, door opens east-west
         draw.rectangle([cx - lw // 2, y, cx + lw // 2, y + cell_size], fill=BLACK)
         draw.rectangle(
             [cx - half, cy - half, cx + half, cy + half],
@@ -308,7 +427,6 @@ def _draw_door_symbol(draw, x, y, cell_size, orient):
         draw.point((cx - half, cy + half), fill=GRAY)
         draw.point((cx + half, cy + half), fill=GRAY)
     else:
-        # Wall runs east-west, door opens north-south
         draw.rectangle([x, cy - lw // 2, x + cell_size, cy + lw // 2], fill=BLACK)
         draw.rectangle(
             [cx - half, cy - half, cx + half, cy + half],
@@ -409,8 +527,12 @@ def _draw_secret_symbol(draw, x, y, cell_size, orient):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: Stairs
+# ---------------------------------------------------------------------------
+
 def _draw_stairs(draw, stairs, cell_data, cell_size, row_off, col_off):
-    """Draw stair symbols using coordinates from the stairs array."""
+    """Draw stair symbols. Stairs span 2 cells in the direction they face."""
     for stair in stairs:
         row, col = stair["row"], stair["col"]
         direction = stair["dir"]
@@ -419,68 +541,78 @@ def _draw_stairs(draw, stairs, cell_data, cell_size, row_off, col_off):
         x = col * cell_size
         y = row * cell_size
 
-        if key == "up":
-            _draw_stair_up(draw, x, y, cell_size, direction)
+        if direction == "east":
+            sx, sy = x, y
+            sw, sh = cell_size * 2, cell_size
+        elif direction == "west":
+            sx, sy = x - cell_size, y
+            sw, sh = cell_size * 2, cell_size
+        elif direction == "south":
+            sx, sy = x, y
+            sw, sh = cell_size, cell_size * 2
+        elif direction == "north":
+            sx, sy = x, y - cell_size
+            sw, sh = cell_size, cell_size * 2
         else:
-            _draw_stair_down(draw, x, y, cell_size, direction)
+            continue
+
+        wall_w = max(2, cell_size // 7)
+
+        if key == "up":
+            _draw_stair_up(draw, sx, sy, sw, sh, wall_w, direction)
+        else:
+            _draw_stair_down(draw, sx, sy, sw, sh, wall_w, direction)
 
 
-def _draw_stair_up(draw, x, y, cell_size, direction):
-    """Draw stair up: alternating stripes (hatching) filling the cell."""
-    wall_w = max(2, cell_size // 7)
+def _draw_stair_up(draw, sx, sy, sw, sh, wall_w, direction):
+    """Draw stair up: alternating stripes (hatching) filling the 2-cell area."""
     spacing = 2
-
-    if direction == "east":
-        for px in range(x + wall_w, x + cell_size, spacing):
-            draw.line([(px, y + wall_w), (px, y + cell_size - wall_w)], fill=STAIR_COLOR)
-    elif direction == "west":
-        for px in range(x, x + cell_size - wall_w, spacing):
-            draw.line([(px, y + wall_w), (px, y + cell_size - wall_w)], fill=STAIR_COLOR)
-    elif direction == "north":
-        for py in range(y, y + cell_size - wall_w, spacing):
-            draw.line([(x + wall_w, py), (x + cell_size - wall_w, py)], fill=STAIR_COLOR)
-    elif direction == "south":
-        for py in range(y + wall_w, y + cell_size, spacing):
-            draw.line([(x + wall_w, py), (x + cell_size - wall_w, py)], fill=STAIR_COLOR)
+    if direction in ("east", "west"):
+        for px in range(sx + wall_w, sx + sw, spacing):
+            draw.line([(px, sy + wall_w), (px, sy + sh - wall_w)], fill=STAIR_COLOR)
+    else:
+        for py in range(sy + wall_w, sy + sh, spacing):
+            draw.line([(sx + wall_w, py), (sx + sw - wall_w, py)], fill=STAIR_COLOR)
 
 
-def _draw_stair_down(draw, x, y, cell_size, direction):
+def _draw_stair_down(draw, sx, sy, sw, sh, wall_w, direction):
     """Draw stair down: progressively wider bars forming a staircase."""
-    wall_w = max(2, cell_size // 7)
-    inner = cell_size - wall_w * 2
-    cx = x + cell_size // 2
-    cy = y + cell_size // 2
-    n_steps = max(3, inner // 3)
+    cx = sx + sw // 2
+    cy = sy + sh // 2
 
-    if direction == "south":
+    if direction in ("south", "north"):
+        inner_w = sw - wall_w * 2
+        inner_h = sh - wall_w * 2
+        n_steps = max(3, inner_h // 3)
         for i in range(n_steps):
             t = (i + 1) / n_steps
-            half_w = int(t * inner / 2)
-            step_y = y + wall_w + int(t * inner)
-            if step_y < y + cell_size - wall_w:
-                draw.line([(cx - half_w, step_y), (cx + half_w, step_y)], fill=STAIR_COLOR)
-    elif direction == "north":
+            half_w = int(t * inner_w / 2)
+            if direction == "south":
+                step_y = sy + wall_w + int(t * inner_h)
+            else:
+                step_y = sy + sh - wall_w - int(t * inner_h)
+            if sy + wall_w <= step_y <= sy + sh - wall_w:
+                draw.line([(cx - half_w, step_y), (cx + half_w, step_y)],
+                          fill=STAIR_COLOR)
+    else:
+        inner_w = sw - wall_w * 2
+        inner_h = sh - wall_w * 2
+        n_steps = max(3, inner_w // 3)
         for i in range(n_steps):
             t = (i + 1) / n_steps
-            half_w = int(t * inner / 2)
-            step_y = y + cell_size - wall_w - int(t * inner)
-            if step_y >= y + wall_w:
-                draw.line([(cx - half_w, step_y), (cx + half_w, step_y)], fill=STAIR_COLOR)
-    elif direction == "east":
-        for i in range(n_steps):
-            t = (i + 1) / n_steps
-            half_h = int(t * inner / 2)
-            step_x = x + wall_w + int(t * inner)
-            if step_x < x + cell_size - wall_w:
-                draw.line([(step_x, cy - half_h), (step_x, cy + half_h)], fill=STAIR_COLOR)
-    elif direction == "west":
-        for i in range(n_steps):
-            t = (i + 1) / n_steps
-            half_h = int(t * inner / 2)
-            step_x = x + cell_size - wall_w - int(t * inner)
-            if step_x >= x + wall_w:
-                draw.line([(step_x, cy - half_h), (step_x, cy + half_h)], fill=STAIR_COLOR)
+            half_h = int(t * inner_h / 2)
+            if direction == "east":
+                step_x = sx + wall_w + int(t * inner_w)
+            else:
+                step_x = sx + sw - wall_w - int(t * inner_w)
+            if sx + wall_w <= step_x <= sx + sw - wall_w:
+                draw.line([(step_x, cy - half_h), (step_x, cy + half_h)],
+                          fill=STAIR_COLOR)
 
+
+# ---------------------------------------------------------------------------
+# Phase 4: Labels
+# ---------------------------------------------------------------------------
 
 def _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off):
     """Draw room numbers and corridor feature labels on the map."""
