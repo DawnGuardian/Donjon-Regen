@@ -73,9 +73,9 @@ class DonjonRegenApp:
         )
         if path:
             self.json_path.set(path)
-            # Default output dir to same folder as JSON
+            # Default output dir to renders/
             if not self.output_dir.get():
-                self.output_dir.set(str(Path(path).parent))
+                self.output_dir.set(str(Path(path).parent / "renders"))
 
     def _browse_output(self):
         path = filedialog.askdirectory(title="Select Output Directory")

@@ -19,7 +19,7 @@ ROOM_ID    = 65472       # bits 6-15
 LABEL      = 4278190080  # bits 24-31
 
 OPEN_SPACE = ROOM | CORRIDOR
-DOOR_TYPES = DOOR | ARCH | PORTCULLIS | SECRET
+DOOR_TYPES = DOOR | ARCH | PORTCULLIS | SECRET | LOCKED | TRAPPED
 
 
 def is_open(cell):
@@ -56,11 +56,11 @@ def door_type(cell):
         return "portcullis"
     if cell & SECRET:
         return "secret"
+    if cell & LOCKED:
+        return "locked"
+    if cell & TRAPPED:
+        return "trapped"
     if cell & DOOR:
-        if cell & LOCKED:
-            return "locked"
-        if cell & TRAPPED:
-            return "trapped"
         return "door"
     if cell & ARCH:
         return "arch"

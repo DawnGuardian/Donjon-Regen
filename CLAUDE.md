@@ -7,9 +7,23 @@ Recreates [donjon.bin.sh](https://donjon.bin.sh/5e/dungeon/) dungeon generator o
 ```
 Donjon-Regen/           # Project root — all source lives here
   main.py               # CLI entry point
+  generate.py           # Shared generation logic (used by CLI and GUI)
+  gui.py                # Tkinter GUI
   cells.py              # Cell bitmask constants & helper functions
   renderer.py           # PIL-based map renderer (GM & player maps)
   html_gen.py           # HTML generator (embedded map, image map areas, detail tables)
+  assets/               # Symbol assets extracted from key.png
+    key.png             # Original door/stair symbol legend
+    archway.png         # Individual symbol PNGs (split from key.png)
+    portcullis.png
+    door.png
+    locked.png
+    trapped.png
+    secret.png
+    up.png
+    down.png
+  test-data/            # Reference test files (deletable/replaceable)
+  renders/              # Generated output files (default output directory)
   pyproject.toml
   CLAUDE.md
 ```
@@ -17,11 +31,10 @@ Donjon-Regen/           # Project root — all source lives here
 ## Usage
 
 ```bash
-python3 main.py <dungeon.json>
-# e.g. python3 main.py test.json
+uv run python main.py <dungeon.json>
+# e.g. uv run python main.py test-data/test.json
+# Output goes to renders/ by default, override with -o <dir>
 ```
-
-Output files are named after the dungeon (from JSON `settings.name`) and placed next to the input JSON.
 
 ## Dependencies
 
@@ -72,14 +85,15 @@ When no padding exists (cells size == n_rows × n_cols), offset is 0.
 - **Player map**: 50px per cell, no labels
 - **Polygon rooms**: Regular N-sided polygon inscribed in a circle centered on the room's bounding box. Drawn as geometric white fills directly — cell data may only contain a subset of room cells.
 - **Circle rooms**: PIL ellipse drawn directly as white fill from bounding box.
-- **Doors**: Orientation determined from room door direction data (`north/south` → horizontal wall, `east/west` → vertical wall). Small rectangle outline for regular doors; dots for arches; dashed dots for portcullises; S glyph for secret doors.
+- **Doors**: Rendered by scaling and pasting assets from `assets/` (extracted from key.png). For vertical wall doors (east/west), used as-is. For horizontal wall doors (north/south), rotated 90°. White pixels in assets are made transparent before compositing.
 - **Stairs**: Coordinates from JSON `stairs` array (in map coordinate space). Hatching for stair-up; progressive bars for stair-down.
 - **Grid lines**: Must be drawn AFTER all white fills to avoid being overwritten.
 
-## Reference Files
+## Reference Files (in test-data/)
 
 - `test.json` — Source dungeon data from donjon.bin.sh
-- `test (91 x 91).png` — Reference GM map
-- `test (player, 91 x 91).png` — Reference player map
+- `test (rr x cc).png` — Reference GM map that is 'rr' rows and 'cc' columns
+- `test (player, rr x cc).png` — Reference player map that is 'rr' rows and 'cc' columns
+- `test (print, rr x cc).png` — Print version, up-scaled for printing
 - `test.html` — Reference HTML document
-- `key.png` — Door/stair symbol legend assets
+- `test.tsv` — Dungeon data in TSV format (to be generated, not used as input)

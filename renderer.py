@@ -1,9 +1,12 @@
 """Map renderer - generates GM and player map PNGs from dungeon JSON data."""
 
 import math
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 import cells as C
+
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 # Colors
 BLACK = (0, 0, 0)
@@ -163,8 +166,8 @@ def render_map(dungeon, cell_size=None, gm_mode=True):
     _draw_polymorph_outlines(draw, rooms, cell_size)
 
     # Phase 4: Doors, stairs, labels
-    _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
-                door_orient_map)
+    _draw_doors_on_img(img, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
+                       door_orient_map)
     _draw_stairs(draw, stairs, cell_data, cell_size, row_off, col_off)
     if gm_mode:
         _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off)
@@ -362,12 +365,64 @@ def _draw_polymorph_outlines(draw, rooms, cell_size):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Doors
+# Phase 4: Doors — asset-based rendering
 # ---------------------------------------------------------------------------
 
-def _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
-                door_orient_map):
-    """Draw door symbols on the map."""
+# Cache for loaded and scaled door symbol images
+_door_asset_cache = {}
+
+
+def _load_door_asset(name, cell_size, orient):
+    """Load a door symbol asset, scale to cell_size, and rotate for orientation.
+
+    The key.png symbols are drawn for a vertical wall (wall bars at top/bottom,
+    symbol opens left-right). For horizontal wall doors the asset is rotated 90°.
+
+    Returns a PIL Image with transparency (RGBA).
+    """
+    cache_key = (name, cell_size, orient)
+    if cache_key in _door_asset_cache:
+        return _door_asset_cache[cache_key]
+
+    asset_path = ASSETS_DIR / f"{name}.png"
+    src = Image.open(asset_path).convert("RGBA")
+
+    # Make white pixels transparent so the symbol composites cleanly
+    pixels = src.load()
+    for y in range(src.height):
+        for x in range(src.width):
+            r, g, b, a = pixels[x, y]
+            if r > 200 and g > 200 and b > 200:
+                pixels[x, y] = (255, 255, 255, 0)
+
+    # Scale to cell_size x cell_size (LANCZOS preserves thin details like
+    # the locked door's center line and trapped door's cross bar)
+    scaled = src.resize((cell_size, cell_size), Image.LANCZOS)
+
+    # Threshold: LANCZOS produces anti-aliased grays. Snap pixels to either
+    # opaque black/gray or fully transparent so the symbol stays crisp.
+    sp = scaled.load()
+    for y in range(scaled.height):
+        for x in range(scaled.width):
+            r, g, b, a = sp[x, y]
+            if a < 64:
+                sp[x, y] = (0, 0, 0, 0)
+            else:
+                sp[x, y] = (r, g, b, 255)
+
+    # The asset shows a vertical wall orientation (wall at top/bottom).
+    # For horizontal wall doors (north/south), rotate 90° clockwise.
+    if orient == "horizontal":
+        scaled = scaled.rotate(-90, expand=True)
+
+    _door_asset_cache[cache_key] = scaled
+    return scaled
+
+
+
+def _draw_doors_on_img(img, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
+                       door_orient_map):
+    """Draw door symbols by pasting scaled assets onto the image directly."""
     for row in range(n_rows):
         for col in range(n_cols):
             cell = _cell(cell_data, row, col, row_off, col_off)
@@ -382,14 +437,17 @@ def _draw_doors(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
             if orient is None:
                 orient = _orient_from_neighbors(cell_data, row, col, row_off, col_off)
 
-            if dt == "arch":
-                _draw_arch_symbol(draw, x, y, cell_size, orient)
-            elif dt == "portcullis":
-                _draw_portcullis_symbol(draw, x, y, cell_size, orient)
-            elif dt == "secret":
-                _draw_secret_symbol(draw, x, y, cell_size, orient)
-            else:
-                _draw_door_symbol(draw, x, y, cell_size, orient)
+            asset_name = {
+                "arch": "archway",
+                "portcullis": "portcullis",
+                "door": "door",
+                "locked": "locked",
+                "trapped": "trapped",
+                "secret": "secret",
+            }.get(dt, "door")
+
+            asset = _load_door_asset(asset_name, cell_size, orient)
+            img.paste(asset, (x, y), asset)  # use alpha channel as mask
 
 
 def _orient_from_neighbors(cell_data, row, col, row_off, col_off):
@@ -407,124 +465,6 @@ def _orient_from_neighbors(cell_data, row, col, row_off, col_off):
     if v_walls > h_walls:
         return "vertical"
     return "horizontal"
-
-
-def _draw_door_symbol(draw, x, y, cell_size, orient):
-    """Draw a regular door: rectangle outline with connecting lines to walls."""
-    cx = x + cell_size // 2
-    cy = y + cell_size // 2
-    half = max(3, (cell_size * 3) // 7)
-    lw = max(1, cell_size // 5)
-
-    if orient == "vertical":
-        draw.rectangle([cx - lw // 2, y, cx + lw // 2, y + cell_size], fill=BLACK)
-        draw.rectangle(
-            [cx - half, cy - half, cx + half, cy + half],
-            fill=DOOR_FILL, outline=DOOR_OUTLINE,
-        )
-        draw.point((cx - half, cy - half), fill=GRAY)
-        draw.point((cx + half, cy - half), fill=GRAY)
-        draw.point((cx - half, cy + half), fill=GRAY)
-        draw.point((cx + half, cy + half), fill=GRAY)
-    else:
-        draw.rectangle([x, cy - lw // 2, x + cell_size, cy + lw // 2], fill=BLACK)
-        draw.rectangle(
-            [cx - half, cy - half, cx + half, cy + half],
-            fill=DOOR_FILL, outline=DOOR_OUTLINE,
-        )
-        draw.point((cx - half, cy - half), fill=GRAY)
-        draw.point((cx + half, cy - half), fill=GRAY)
-        draw.point((cx - half, cy + half), fill=GRAY)
-        draw.point((cx + half, cy + half), fill=GRAY)
-
-
-def _draw_arch_symbol(draw, x, y, cell_size, orient):
-    """Draw an archway: two small dots at wall edges with open space."""
-    cx = x + cell_size // 2
-    cy = y + cell_size // 2
-    lw = max(1, cell_size // 5)
-
-    if orient == "vertical":
-        draw.rectangle([cx - lw // 2, y, cx + lw // 2, y + cell_size], fill=BLACK)
-        gap = max(3, cell_size // 2)
-        draw.rectangle(
-            [cx - lw // 2 - 1, cy - gap, cx + lw // 2 + 1, cy + gap],
-            fill=WHITE,
-        )
-        draw.point((cx, cy - gap), fill=GRAY)
-        draw.point((cx - 1, cy - gap), fill=GRAY)
-        draw.point((cx, cy + gap), fill=GRAY)
-        draw.point((cx - 1, cy + gap), fill=GRAY)
-    else:
-        draw.rectangle([x, cy - lw // 2, x + cell_size, cy + lw // 2], fill=BLACK)
-        gap = max(3, cell_size // 2)
-        draw.rectangle(
-            [cx - gap, cy - lw // 2 - 1, cx + gap, cy + lw // 2 + 1],
-            fill=WHITE,
-        )
-        draw.point((cx - gap, cy), fill=GRAY)
-        draw.point((cx - gap, cy - 1), fill=GRAY)
-        draw.point((cx + gap, cy), fill=GRAY)
-        draw.point((cx + gap, cy - 1), fill=GRAY)
-
-
-def _draw_portcullis_symbol(draw, x, y, cell_size, orient):
-    """Draw a portcullis: alternating dots/dashes across the opening."""
-    cx = x + cell_size // 2
-    cy = y + cell_size // 2
-    lw = max(1, cell_size // 5)
-
-    if orient == "vertical":
-        draw.rectangle([cx - lw // 2, y, cx + lw // 2, y + cell_size], fill=BLACK)
-        draw.rectangle(
-            [cx - lw, cy - (cell_size // 2 - 2), cx + lw, cy + (cell_size // 2 - 2)],
-            fill=WHITE,
-        )
-        spacing = max(2, cell_size // 5)
-        py = cy - (cell_size // 2 - 3)
-        while py <= cy + (cell_size // 2 - 3):
-            draw.point((cx, py), fill=BLACK)
-            draw.point((cx - 1, py), fill=GRAY)
-            draw.point((cx + 1, py), fill=GRAY)
-            py += spacing
-    else:
-        draw.rectangle([x, cy - lw // 2, x + cell_size, cy + lw // 2], fill=BLACK)
-        draw.rectangle(
-            [cx - (cell_size // 2 - 2), cy - lw, cx + (cell_size // 2 - 2), cy + lw],
-            fill=WHITE,
-        )
-        spacing = max(2, cell_size // 5)
-        px = cx - (cell_size // 2 - 3)
-        while px <= cx + (cell_size // 2 - 3):
-            draw.point((px, cy), fill=BLACK)
-            draw.point((px, cy - 1), fill=GRAY)
-            draw.point((px, cy + 1), fill=GRAY)
-            px += spacing
-
-
-def _draw_secret_symbol(draw, x, y, cell_size, orient):
-    """Draw a secret door: S-shaped pattern."""
-    cx = x + cell_size // 2
-    cy = y + cell_size // 2
-    lw = max(1, cell_size // 5)
-
-    if orient == "vertical":
-        draw.rectangle([cx - lw // 2, y, cx + lw // 2, y + cell_size], fill=BLACK)
-    else:
-        draw.rectangle([x, cy - lw // 2, x + cell_size, cy + lw // 2], fill=BLACK)
-
-    try:
-        font_size = max(6, cell_size - 4)
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
-    bbox = font.getbbox("S")
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    draw.text(
-        (cx - tw // 2, cy - th // 2 - bbox[1]),
-        "S", fill=DOOR_OUTLINE, font=font,
-    )
 
 
 # ---------------------------------------------------------------------------
