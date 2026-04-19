@@ -63,7 +63,9 @@ def room_polygon_vertices(room, cell_size):
 
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2
-    radius = min(x2 - x1, y2 - y1) / 2
+    # Expand radius by 0.5px so boundary cell centers fall clearly inside
+    # the polygon rather than exactly on the edge (where PIL may exclude them)
+    radius = min(x2 - x1, y2 - y1) / 2 + 0.5
 
     vertices = []
     for k in range(n_sides):
@@ -162,7 +164,7 @@ def render_map(dungeon, cell_size=None, gm_mode=True):
                     col_off, dungeon)
 
     # Phase 3: Grid lines and polymorph perimeter outlines
-    _draw_grid(draw, img, n_rows, n_cols, cell_size)
+    _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms)
     _draw_polymorph_outlines(draw, rooms, cell_size)
 
     # Phase 4: Doors, stairs, labels
@@ -298,11 +300,26 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
 # Phase 3: Grid lines and polymorph outlines
 # ---------------------------------------------------------------------------
 
-def _draw_grid(draw, img, n_rows, n_cols, cell_size):
+def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
     """Draw grid lines based on rendered pixel state.
 
     Gray lines between two open cells, wall-color lines at open/closed edges.
+    For polymorph rooms: draw ALL internal grid lines, then mask away any
+    grid pixels that fall outside the white fill area (clipping to geometry).
     """
+    # Build polymorph bounding boxes
+    polymorph_cells = set()
+    polymorph_rooms = []
+    for room in rooms:
+        if room is None:
+            continue
+        if room.get("shape") not in ("polygon", "circle"):
+            continue
+        polymorph_rooms.append(room)
+        for r in range(room["north"], room["south"] + 1):
+            for c in range(room["west"], room["east"] + 1):
+                polymorph_cells.add((r, c))
+
     def _pixel_is_open(r, c):
         """Check if a cell's center pixel is white (rendered as open)."""
         px = c * cell_size + cell_size // 2
@@ -311,6 +328,7 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size):
             return img.getpixel((px, py)) != BLACK
         return False
 
+    # --- Pass 1: Normal grid (same as before — skip wall lines in poly) ---
     for row in range(n_rows):
         for col in range(n_cols):
             if not _pixel_is_open(row, col):
@@ -318,28 +336,88 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size):
 
             x = col * cell_size
             y = row * cell_size
+            in_poly = (row, col) in polymorph_cells
 
             # Right edge
             rx = x + cell_size
-            if col + 1 < n_cols and _pixel_is_open(row, col + 1):
+            neighbor_open = col + 1 < n_cols and _pixel_is_open(row, col + 1)
+            neighbor_in_poly = (row, col + 1) in polymorph_cells
+            if neighbor_open:
                 draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
+            elif in_poly or neighbor_in_poly:
+                pass  # polymorph outline handles perimeter
             else:
                 draw.line([(rx, y), (rx, y + cell_size)], fill=WALL_COLOR)
 
             # Bottom edge
             by = y + cell_size
-            if row + 1 < n_rows and _pixel_is_open(row + 1, col):
+            neighbor_open = row + 1 < n_rows and _pixel_is_open(row + 1, col)
+            neighbor_in_poly = (row + 1, col) in polymorph_cells
+            if neighbor_open:
                 draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
+            elif in_poly or neighbor_in_poly:
+                pass
             else:
                 draw.line([(x, by), (x + cell_size, by)], fill=WALL_COLOR)
 
             # Left edge
-            if col == 0 or not _pixel_is_open(row, col - 1):
-                draw.line([(x, y), (x, y + cell_size)], fill=WALL_COLOR)
+            neighbor_open = col > 0 and _pixel_is_open(row, col - 1)
+            neighbor_in_poly = (row, col - 1) in polymorph_cells
+            if not neighbor_open:
+                if in_poly or neighbor_in_poly:
+                    pass
+                else:
+                    draw.line([(x, y), (x, y + cell_size)], fill=WALL_COLOR)
 
             # Top edge
-            if row == 0 or not _pixel_is_open(row - 1, col):
-                draw.line([(x, y), (x + cell_size, y)], fill=WALL_COLOR)
+            neighbor_open = row > 0 and _pixel_is_open(row - 1, col)
+            neighbor_in_poly = (row - 1, col) in polymorph_cells
+            if not neighbor_open:
+                if in_poly or neighbor_in_poly:
+                    pass
+                else:
+                    draw.line([(x, y), (x + cell_size, y)], fill=WALL_COLOR)
+
+    # --- Pass 2: Polymorph grid lines — draw all, then mask to white area ---
+    for room in polymorph_rooms:
+        north, south = room["north"], room["south"]
+        west, east = room["west"], room["east"]
+
+        # Pixel bounding box for this room's cells
+        px_x1 = west * cell_size
+        px_y1 = north * cell_size
+        px_x2 = (east + 1) * cell_size + 1
+        px_y2 = (south + 1) * cell_size + 1
+
+        # Snapshot pixels in this region before drawing grid lines
+        region = img.crop((px_x1, px_y1, px_x2, px_y2)).copy()
+
+        # Draw ALL internal grid lines within the bounding box
+        for r in range(north, south + 1):
+            for c in range(west, east + 1):
+                x = c * cell_size
+                y = r * cell_size
+                # Right edge (internal only — not the last column)
+                if c < east:
+                    rx = x + cell_size
+                    draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
+                # Bottom edge (internal only — not the last row)
+                if r < south:
+                    by = y + cell_size
+                    draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
+
+        # Mask: revert any grid pixels that were drawn over non-white areas.
+        # A grid pixel should only survive if the underlying area was white.
+        pixels = img.load()
+        region_pixels = region.load()
+        for py in range(px_y1, min(px_y2, img.height)):
+            for px in range(px_x1, min(px_x2, img.width)):
+                current = pixels[px, py]
+                orig = region_pixels[px - px_x1, py - px_y1]
+                # If this pixel is now grid-colored but was black before,
+                # it's outside the white fill — revert it
+                if current == GRID_COLOR and orig == BLACK:
+                    pixels[px, py] = BLACK
 
 
 def _draw_polymorph_outlines(draw, rooms, cell_size):
