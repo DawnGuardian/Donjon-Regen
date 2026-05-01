@@ -368,6 +368,21 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
             return img.getpixel((px, py))[0] > 128
         return False
 
+    # Snapshot each polymorph room's bbox BEFORE Pass 1 — Pass 2 needs the
+    # clean polygon-fill-only state as its mask reference. (If snapshotted
+    # after Pass 1, grid lines drawn there along the bbox edges leak through
+    # because the snapshot already shows them as GRID_COLOR.)
+    poly_snapshots = {}
+    for room in polymorph_rooms:
+        px_x1 = room["west"] * cell_size
+        px_y1 = room["north"] * cell_size
+        px_x2 = (room["east"] + 1) * cell_size + 1
+        px_y2 = (room["south"] + 1) * cell_size + 1
+        poly_snapshots[id(room)] = (
+            (px_x1, px_y1, px_x2, px_y2),
+            img.crop((px_x1, px_y1, px_x2, px_y2)).copy(),
+        )
+
     # --- Pass 1: Normal grid (same as before — skip wall lines in poly) ---
     for row in range(n_rows):
         for col in range(n_cols):
@@ -423,14 +438,9 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
         north, south = room["north"], room["south"]
         west, east = room["west"], room["east"]
 
-        # Pixel bounding box for this room's cells
-        px_x1 = west * cell_size
-        px_y1 = north * cell_size
-        px_x2 = (east + 1) * cell_size + 1
-        px_y2 = (south + 1) * cell_size + 1
-
-        # Snapshot pixels in this region before drawing grid lines
-        region = img.crop((px_x1, px_y1, px_x2, px_y2)).copy()
+        # Use the pre-Pass-1 snapshot as the mask reference, so any rogue
+        # GRID_COLOR pixels Pass 1 drew along bbox boundaries get reverted.
+        (px_x1, px_y1, px_x2, px_y2), region = poly_snapshots[id(room)]
 
         # Draw ALL internal grid lines within the bounding box
         for r in range(north, south + 1):
