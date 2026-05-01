@@ -87,7 +87,7 @@ def _build_image_map_areas(dungeon, cell_size):
         if shape_type == "polygon":
             vertices = room_polygon_vertices(room, cell_size)
             if vertices:
-                coords = ",".join(f"{vx},{vy}" for vx, vy in vertices)
+                coords = ",".join(f"{round(vx)},{round(vy)}" for vx, vy in vertices)
                 parts.append(
                     f'<area alt="{_esc(alt_text)}" coords="{coords}" '
                     f'href="{href}" shape="poly" title="{_esc(alt_text)}" />'

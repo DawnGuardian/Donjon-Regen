@@ -48,7 +48,7 @@ def _cell(cell_data, map_row, map_col, row_off, col_off):
 # ---------------------------------------------------------------------------
 
 def room_polygon_vertices(room, cell_size):
-    """Compute polygon vertices for a shaped room."""
+    """Compute float polygon vertices (sub-pixel precision) for a shaped room."""
     n_sides = room.get("polygon", 0)
     if n_sides < 3:
         return None
@@ -63,8 +63,8 @@ def room_polygon_vertices(room, cell_size):
 
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2
-    # Expand radius by 0.5px so boundary cell centers fall clearly inside
-    # the polygon rather than exactly on the edge (where PIL may exclude them)
+    # Reference donjon output expands the inscribed circle radius by ~0.5px,
+    # so boundary pixel coverage matches the reference renderer.
     radius = min(x2 - x1, y2 - y1) / 2 + 0.5
 
     vertices = []
@@ -72,7 +72,7 @@ def room_polygon_vertices(room, cell_size):
         angle = -math.pi / 2 + 2 * math.pi * k / n_sides
         vx = cx + radius * math.cos(angle)
         vy = cy + radius * math.sin(angle)
-        vertices.append((round(vx), round(vy)))
+        vertices.append((vx, vy))
     return vertices
 
 
@@ -157,15 +157,15 @@ def render_map(dungeon, cell_size=None, gm_mode=True):
     # Phase 1: Rooms
     _fill_rooms(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
                 polymorph_ids)
-    _fill_polymorph_rooms(draw, rooms, cell_size)
+    _fill_polymorph_rooms(img, rooms, cell_size)
 
     # Phase 2: Corridors (with directional invasion into polymorph rooms)
     _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
                     col_off, dungeon)
 
-    # Phase 3: Grid lines and polymorph perimeter outlines
+    # Phase 3: Grid lines (polymorph edges are the natural anti-aliased
+    # boundary of the white fill — no explicit perimeter outline needed).
     _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms)
-    _draw_polymorph_outlines(draw, rooms, cell_size)
 
     # Phase 4: Doors, stairs, labels
     _draw_doors_on_img(img, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
@@ -197,8 +197,26 @@ def _fill_rooms(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
             draw.rectangle([x, y, x + cell_size, y + cell_size], fill=WHITE)
 
 
-def _fill_polymorph_rooms(draw, rooms, cell_size):
-    """Draw polymorph rooms as proper geometric shapes (white fill)."""
+# Supersampling factor for anti-aliased polymorph room rendering. The mask
+# is drawn at SCALE x resolution then downsampled with BILINEAR, so boundary
+# pixels receive partial white coverage proportional to the geometric shape's
+# overlap with the pixel — matching the donjon reference output.
+_POLYMORPH_AA_SCALE = 4
+
+
+def _fill_polymorph_rooms(img, rooms, cell_size):
+    """Draw polymorph rooms as anti-aliased geometric shapes (white fill).
+
+    Boundary pixels along the polygon/circle edge receive grayscale values
+    based on sub-pixel coverage, so cells straddling the geometric boundary
+    are partially filled rather than all-or-nothing.
+    """
+    scale = _POLYMORPH_AA_SCALE
+    width, height = img.size
+    mask_hi = Image.new("L", (width * scale, height * scale), 0)
+    draw_hi = ImageDraw.Draw(mask_hi)
+
+    drew_anything = False
     for room in rooms:
         if room is None:
             continue
@@ -206,13 +224,27 @@ def _fill_polymorph_rooms(draw, rooms, cell_size):
         if shape == "polygon":
             vertices = room_polygon_vertices(room, cell_size)
             if vertices:
-                draw.polygon(vertices, fill=WHITE)
+                hi_verts = [(x * scale, y * scale) for x, y in vertices]
+                draw_hi.polygon(hi_verts, fill=255)
+                drew_anything = True
         elif shape == "circle":
             cx, cy, radius = room_circle_params(room, cell_size)
-            draw.ellipse(
-                [cx - radius, cy - radius, cx + radius, cy + radius],
-                fill=WHITE,
+            draw_hi.ellipse(
+                [(cx - radius) * scale, (cy - radius) * scale,
+                 (cx + radius) * scale, (cy + radius) * scale],
+                fill=255,
             )
+            drew_anything = True
+
+    if not drew_anything:
+        return
+
+    # BILINEAR / BOX gives clean averaging without LANCZOS ringing — important
+    # because corridor invasion uses pixel brightness to detect the polygon
+    # interior, and ringing artifacts would create false "interior" pixels.
+    mask = mask_hi.resize((width, height), Image.BILINEAR)
+    white_layer = Image.new("RGB", (width, height), WHITE)
+    img.paste(white_layer, (0, 0), mask)
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +292,13 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
     }
 
     def _is_white(r, c):
+        # Brightness threshold: anti-aliased polygon edges produce near-black
+        # gray pixels just outside the geometric edge. Treat anything below
+        # mid-gray as "still outside" so corridor invasion can bridge the gap.
         px = c * cell_size + cell_size // 2
         py = r * cell_size + cell_size // 2
         if 0 <= px < img.width and 0 <= py < img.height:
-            return img.getpixel((px, py)) != BLACK
+            return img.getpixel((px, py))[0] > 128
         return False
 
     for room in dungeon.get("rooms", []):
@@ -280,8 +315,12 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
                 r, c = door["row"], door["col"]
                 # Step into the room
                 r, c = r + dr, c + dc
+                # Always fill the first room cell adjacent to the door so
+                # the door tab bridges into the polygon even when the
+                # polygon's anti-aliased edge already covers part of it.
+                first = True
                 while 0 <= r < n_rows and 0 <= c < n_cols:
-                    if _is_white(r, c):
+                    if not first and _is_white(r, c):
                         # Reached the geometric fill — done
                         break
                     cell = _cell(cell_data, r, c, row_off, col_off)
@@ -294,6 +333,7 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
                         [x, y, x + cell_size, y + cell_size], fill=WHITE
                     )
                     r, c = r + dr, c + dc
+                    first = False
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +361,11 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
                 polymorph_cells.add((r, c))
 
     def _pixel_is_open(r, c):
-        """Check if a cell's center pixel is white (rendered as open)."""
+        """Check if a cell's center pixel is open (substantially white)."""
         px = c * cell_size + cell_size // 2
         py = r * cell_size + cell_size // 2
         if 0 <= px < img.width and 0 <= py < img.height:
-            return img.getpixel((px, py)) != BLACK
+            return img.getpixel((px, py))[0] > 128
         return False
 
     # --- Pass 1: Normal grid (same as before — skip wall lines in poly) ---
@@ -406,40 +446,19 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
                     by = y + cell_size
                     draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
 
-        # Mask: revert any grid pixels that were drawn over non-white areas.
-        # A grid pixel should only survive if the underlying area was white.
+        # Mask: a grid pixel should only survive where the underlying fill
+        # was fully white. Black pixels (outside the polygon) and gray
+        # anti-aliased edge pixels both get reverted to their original value
+        # so the smooth boundary isn't recolored to grid gray.
         pixels = img.load()
         region_pixels = region.load()
         for py in range(px_y1, min(px_y2, img.height)):
             for px in range(px_x1, min(px_x2, img.width)):
-                current = pixels[px, py]
+                if pixels[px, py] != GRID_COLOR:
+                    continue
                 orig = region_pixels[px - px_x1, py - px_y1]
-                # If this pixel is now grid-colored but was black before,
-                # it's outside the white fill — revert it
-                if current == GRID_COLOR and orig == BLACK:
-                    pixels[px, py] = BLACK
-
-
-def _draw_polymorph_outlines(draw, rooms, cell_size):
-    """Draw smooth geometric outlines for polymorph rooms.
-
-    This overrides the blocky cell-boundary wall lines with proper
-    polygon/circle perimeters.
-    """
-    for room in rooms:
-        if room is None:
-            continue
-        shape = room.get("shape")
-        if shape == "polygon":
-            vertices = room_polygon_vertices(room, cell_size)
-            if vertices:
-                draw.polygon(vertices, outline=WALL_COLOR)
-        elif shape == "circle":
-            cx, cy, radius = room_circle_params(room, cell_size)
-            draw.ellipse(
-                [cx - radius, cy - radius, cx + radius, cy + radius],
-                outline=WALL_COLOR,
-            )
+                if orig != WHITE:
+                    pixels[px, py] = orig
 
 
 # ---------------------------------------------------------------------------

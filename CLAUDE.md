@@ -41,6 +41,7 @@ uv run python main.py <dungeon.json>
 
 - Python >= 3.14
 - Pillow >= 12.0
+- NumPy >= 2.4 (used for pixel-diff analysis when comparing renders against reference images)
 
 ## Cell Bitmask Encoding
 
@@ -84,8 +85,11 @@ When no padding exists (cells size == n_rows × n_cols), offset is 0.
 
 - **GM map**: `cell_size` from JSON settings (varies per dungeon), includes room number labels and corridor feature labels
 - **Player map**: 50px per cell, no labels
-- **Polygon rooms**: Regular N-sided polygon inscribed in a circle centered on the room's bounding box. Drawn as geometric white fills directly — cell data may only contain a subset of room cells.
-- **Circle rooms**: PIL ellipse drawn directly as white fill from bounding box.
+- **Polygon rooms**: Regular N-sided polygon inscribed in a circle centered on the room's bounding box. Cell data may only contain a subset of room cells.
+- **Circle rooms**: PIL ellipse from bounding box.
+- **Polymorph (polygon/circle) anti-aliasing**: Rendered via a 4× supersampled grayscale mask (`L` mode), downsampled with `Image.BILINEAR`, then composited as `WHITE`. Boundary pixels along the geometric edge get partial white coverage. The natural anti-aliased fill edge serves as the room's perimeter — no explicit `WALL_COLOR` outline is drawn (the donjon reference has no `WALL_COLOR` pixels along polygon edges). LANCZOS is avoided here because its ringing produces faint non-zero pixels outside the shape that confuse `_is_white` corridor-invasion detection.
+- **Corridor invasion into polymorph rooms**: Walks inward from each door cell. Always fills the first room cell adjacent to the door (the "door tab"); from there, stops when it reaches a cell whose center pixel is brighter than mid-gray (>128). The brightness threshold is required because anti-aliased edge pixels are near-black gray, not pure black.
+- **Polymorph grid lines** (`_draw_grid` Pass 2): drawn across the bounding box, then any grid pixel whose underlying fill wasn't fully white is reverted to its original value. This preserves anti-aliased edge pixels rather than recoloring them grid-gray.
 - **Doors**: Rendered by scaling and pasting assets from `assets/` (extracted from key.png). For vertical wall doors (east/west), used as-is. For horizontal wall doors (north/south), rotated 90°. White pixels in assets are made transparent before compositing.
 - **Stairs**: Coordinates from JSON `stairs` array (in map coordinate space). Hatching for stair-up; progressive bars for stair-down.
 - **Grid lines**: Must be drawn AFTER all white fills to avoid being overwritten.
