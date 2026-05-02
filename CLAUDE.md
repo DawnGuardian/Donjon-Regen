@@ -94,6 +94,7 @@ When no padding exists (cells size == n_rows × n_cols), offset is 0.
 - **Doors**: Rendered by scaling and pasting assets from `assets/` (extracted from key.png). For vertical wall doors (east/west), used as-is. For horizontal wall doors (north/south), rotated 90°. White pixels in assets are made transparent before compositing.
 - **Stairs**: Coordinates from JSON `stairs` array (in map coordinate space). Hatching for stair-up; progressive bars for stair-down.
 - **Grid lines**: Must be drawn AFTER all white fills to avoid being overwritten.
+- **Labels (room numbers, corridor letters)**: Rendered with `draw.fontmode = "1"` (1-bit aliased) so glyph edges are pure-black pixels. This deliberately diverges from the donjon reference, which uses grayscale anti-aliased text — the sharper output is easier to read at small cell sizes.
 
 ## Reference Files (in test-data/)
 
