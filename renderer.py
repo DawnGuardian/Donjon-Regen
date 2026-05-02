@@ -343,11 +343,15 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
 def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
     """Draw grid lines based on rendered pixel state.
 
-    Gray lines between two open cells, wall-color lines at open/closed edges.
-    For polymorph rooms: draw ALL internal grid lines, then mask away any
-    grid pixels that fall outside the white fill area (clipping to geometry).
+    The reference renderer uses ONE color (GRID_COLOR) for every cell-edge
+    line touching an open cell — open/open and open/closed boundaries alike.
+    There is no separate "wall color"; walls are simply the black background
+    showing through where no open cell exists on either side.
+
+    For polymorph rooms: draw ALL internal grid lines within the bbox, then
+    mask away any grid pixels that fall outside the white fill area (so the
+    smooth anti-aliased boundary is not recolored).
     """
-    # Build polymorph bounding boxes
     polymorph_cells = set()
     polymorph_rooms = []
     for room in rooms:
@@ -361,17 +365,15 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
                 polymorph_cells.add((r, c))
 
     def _pixel_is_open(r, c):
-        """Check if a cell's center pixel is open (substantially white)."""
         px = c * cell_size + cell_size // 2
         py = r * cell_size + cell_size // 2
         if 0 <= px < img.width and 0 <= py < img.height:
             return img.getpixel((px, py))[0] > 128
         return False
 
-    # Snapshot each polymorph room's bbox BEFORE Pass 1 — Pass 2 needs the
-    # clean polygon-fill-only state as its mask reference. (If snapshotted
-    # after Pass 1, grid lines drawn there along the bbox edges leak through
-    # because the snapshot already shows them as GRID_COLOR.)
+    # Snapshot polymorph bboxes BEFORE Pass 1 — Pass 2's mask needs the clean
+    # polygon-fill-only state. (Snapshotting after Pass 1 would preserve any
+    # rogue grid stubs Pass 1 drew along bbox edges.)
     poly_snapshots = {}
     for room in polymorph_rooms:
         px_x1 = room["west"] * cell_size
@@ -383,7 +385,7 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
             img.crop((px_x1, px_y1, px_x2, px_y2)).copy(),
         )
 
-    # --- Pass 1: Normal grid (same as before — skip wall lines in poly) ---
+    # --- Pass 1: Draw GRID_COLOR on every edge of every open cell ---
     for row in range(n_rows):
         for col in range(n_cols):
             if not _pixel_is_open(row, col):
@@ -395,43 +397,28 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
 
             # Right edge
             rx = x + cell_size
-            neighbor_open = col + 1 < n_cols and _pixel_is_open(row, col + 1)
             neighbor_in_poly = (row, col + 1) in polymorph_cells
-            if neighbor_open:
+            if not (in_poly or neighbor_in_poly):
                 draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
-            elif in_poly or neighbor_in_poly:
-                pass  # polymorph outline handles perimeter
-            else:
-                draw.line([(rx, y), (rx, y + cell_size)], fill=WALL_COLOR)
 
             # Bottom edge
             by = y + cell_size
-            neighbor_open = row + 1 < n_rows and _pixel_is_open(row + 1, col)
             neighbor_in_poly = (row + 1, col) in polymorph_cells
-            if neighbor_open:
+            if not (in_poly or neighbor_in_poly):
                 draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
-            elif in_poly or neighbor_in_poly:
-                pass
-            else:
-                draw.line([(x, by), (x + cell_size, by)], fill=WALL_COLOR)
 
-            # Left edge
+            # Left edge — only if neighbor not open (open neighbor draws it
+            # from its own right edge to avoid double-drawing)
             neighbor_open = col > 0 and _pixel_is_open(row, col - 1)
             neighbor_in_poly = (row, col - 1) in polymorph_cells
-            if not neighbor_open:
-                if in_poly or neighbor_in_poly:
-                    pass
-                else:
-                    draw.line([(x, y), (x, y + cell_size)], fill=WALL_COLOR)
+            if not neighbor_open and not (in_poly or neighbor_in_poly):
+                draw.line([(x, y), (x, y + cell_size)], fill=GRID_COLOR)
 
-            # Top edge
+            # Top edge — same rule
             neighbor_open = row > 0 and _pixel_is_open(row - 1, col)
             neighbor_in_poly = (row - 1, col) in polymorph_cells
-            if not neighbor_open:
-                if in_poly or neighbor_in_poly:
-                    pass
-                else:
-                    draw.line([(x, y), (x + cell_size, y)], fill=WALL_COLOR)
+            if not neighbor_open and not (in_poly or neighbor_in_poly):
+                draw.line([(x, y), (x + cell_size, y)], fill=GRID_COLOR)
 
     # --- Pass 2: Polymorph grid lines — draw all, then mask to white area ---
     for room in polymorph_rooms:
@@ -662,12 +649,19 @@ def _draw_stair_down(draw, sx, sy, sw, sh, wall_w, direction):
 # ---------------------------------------------------------------------------
 
 def _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off):
-    """Draw room numbers and corridor feature labels on the map."""
+    """Draw room numbers and corridor feature labels on the map.
+
+    Uses 1-bit (aliased) font rendering so glyph edges are crisp pure-black
+    pixels rather than the grayscale anti-aliased pixels the donjon reference
+    produces.
+    """
     try:
         font_size = max(8, cell_size - 4)
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
     except (OSError, IOError):
         font = ImageFont.load_default()
+
+    draw.fontmode = "1"
 
     for row in range(n_rows):
         for col in range(n_cols):
