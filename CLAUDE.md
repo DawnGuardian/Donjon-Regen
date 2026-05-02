@@ -8,7 +8,7 @@ Recreates [donjon.bin.sh](https://donjon.bin.sh/5e/dungeon/) dungeon generator o
 Donjon-Regen/           # Project root — all source lives here
   main.py               # CLI entry point
   generate.py           # Shared generation logic (used by CLI and GUI)
-  gui.py                # Tkinter GUI
+  gui.py                # PySide6 GUI (viewer-first)
   cells.py              # Cell bitmask constants & helper functions
   renderer.py           # PIL-based map renderer (GM & player maps)
   html_gen.py           # HTML generator (embedded map, image map areas, detail tables)
@@ -32,9 +32,13 @@ Donjon-Regen/           # Project root — all source lives here
 ## Usage
 
 ```bash
+# CLI — render to PNG/HTML
 uv run python main.py <dungeon.json>
 # e.g. uv run python main.py test-data/test.json
 # Output goes to renders/ by default, override with -o <dir>
+
+# GUI — interactive viewer (open JSON, click rooms/corridors for details)
+uv run python gui.py
 ```
 
 ## Dependencies
@@ -42,6 +46,17 @@ uv run python main.py <dungeon.json>
 - Python >= 3.14
 - Pillow >= 12.0
 - NumPy >= 2.4 (used for pixel-diff analysis when comparing renders against reference images)
+- PySide6 >= 6.8 (GUI; LGPL Qt bindings — installed as a normal PyPI dep)
+
+## GUI (gui.py)
+
+PySide6-based viewer. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / Fit to Window), a horizontal `QSplitter` containing a `Map_View` (left) and a details panel (right), and a status bar.
+
+- **`Map_View`** — `QGraphicsView` subclass. Mouse wheel zooms (anchored under cursor), middle-button drag pans, left-click emits `cell_clicked(row, col)`. Click coords are mapped to scene coords then divided by `cell_size` to get the cell.
+- **Details panel** — `QLabel` title + read-only `QTextEdit`. Will become editable in the next milestone.
+- **Click resolution** — based on the cell bitmask: room → `rooms[id]` (shape, bounds, summary, contents detail, doors); corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
+- **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker`) so the UI stays responsive.
+- **PIL → Qt bridge** — `pil_to_qpixmap` round-trips through PNG bytes (`PIL.Image.save → QImage.fromData → QPixmap.fromImage`). Avoids subtle stride/format issues with `frombytes`.
 
 ## Cell Bitmask Encoding
 
