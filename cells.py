@@ -67,6 +67,29 @@ def door_type(cell):
     return None
 
 
+_DOOR_TYPE_BITS = {
+    "arch": ARCH,
+    "door": DOOR,
+    "locked": LOCKED,
+    "trapped": TRAPPED,
+    "secret": SECRET,
+    "portcullis": PORTCULLIS,
+}
+
+
+def door_type_bit(name):
+    """Return the bitmask for a door type name (e.g. 'locked' → LOCKED)."""
+    return _DOOR_TYPE_BITS.get(name, 0)
+
+
+def set_door_type(cell, name):
+    """Return `cell` with all door-type bits cleared and `name`'s bit set."""
+    return (cell & ~DOOR_TYPES) | _DOOR_TYPE_BITS.get(name, 0)
+
+
+DOOR_TYPE_NAMES = list(_DOOR_TYPE_BITS.keys())
+
+
 def has_stair(cell):
     return bool(cell & (STAIR_DOWN | STAIR_UP))
 

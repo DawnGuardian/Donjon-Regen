@@ -50,13 +50,28 @@ uv run python gui.py
 
 ## GUI (gui.py)
 
-PySide6-based viewer. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / Fit to Window), a horizontal `QSplitter` containing a `Map_View` (left) and a details panel (right), and a status bar.
+PySide6-based viewer/editor. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / Fit to Window), a horizontal `QSplitter` containing a `Map_View` (left) and a `QStackedWidget` details panel (right), and a status bar.
 
-- **`Map_View`** — `QGraphicsView` subclass. Mouse wheel zooms (anchored under cursor), middle-button drag pans, left-click emits `cell_clicked(row, col)`. Click coords are mapped to scene coords then divided by `cell_size` to get the cell.
-- **Details panel** — `QLabel` title + read-only `QTextEdit`. Will become editable in the next milestone.
-- **Click resolution** — based on the cell bitmask: room → `rooms[id]` (shape, bounds, summary, contents detail, doors); corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
+- **`Map_View`** — `QGraphicsView` subclass. Mouse wheel zooms (anchored under cursor), middle-button drag pans, left-click emits `cell_clicked(row, col)`. Click coords are mapped to scene coords then divided by `cell_size` to get the cell. `update_pixmap(pixmap, cell_size)` re-renders without resetting zoom/pan; the `cell_size` arg is required on first load (the view's internal `_cell_size` defaults to 1).
+- **Details panel** — `QStackedWidget` with two pages: page 0 = simple read-only `QLabel`+`QTextEdit` (corridors, doors, wall/wandering); page 1 = `Room_Editor`.
+- **Click resolution** — based on the cell bitmask: room → `Room_Editor` for `rooms[id]`; corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
 - **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker`) so the UI stays responsive.
 - **PIL → Qt bridge** — `pil_to_qpixmap` round-trips through PNG bytes (`PIL.Image.save → QImage.fromData → QPixmap.fromImage`). Avoids subtle stride/format issues with `frombytes`.
+
+### Room editor
+
+Structured form built from the room dict. Edits live in the in-memory dungeon and are flushed by **Apply Changes**; saving to disk is still done via Save Outputs.
+
+- **Summary** — `QLineEdit`.
+- **Inhabited** — read-only line, derived from the monster list (items before the first `'--'`, with the ` (cr …)` suffix stripped, comma-joined). Auto-refreshes when monster items change. Hidden when there are no monsters.
+- **Detail sections** — one per `contents.detail` key. Scalar values get a `QPlainTextEdit`; lists get an `Item_List_Editor`.
+- **`Item_List_Editor`** — vertical list with per-row `QPlainTextEdit` + `✕` delete and a single bottom button. The button label is `+ Add <section title>` (e.g. `+ Add monster`, `+ Add hidden treasure`). Behavior is configured per section via `_SECTION_ADD_RULES`:
+  - `monster` (and any unlisted list section): inserts one blank row **before the first `'--'` separator** so it lands in the monster sub-section, which keeps the Inhabited line correct.
+  - `hidden_treasure`: each click appends a `[container, '--', loot]` triplet at the **end** — a hidden-treasure entry is conceptually a chest/container paired with its loot, separated by `'--'`.
+- **`'--'` (`ITEM_SEPARATOR`)** — rendered as a non-editable horizontal divider, never as an editable row, but preserved at its original position when collecting `values()` so the saved JSON keeps the separator.
+- **Adding sections that aren't in the source** — when a room has no `monster` or `hidden_treasure`, `+ Add Monster Section` / `+ Add Hidden Treasure Section` buttons appear at the bottom of the form. Clicking creates the key with the appropriate initial template (from `_SECTION_INITIAL_ITEMS`) and rebuilds the form. `_collect_edits()` is called first so any in-progress edits in other widgets aren't lost during the rebuild.
+- **`Door_Row`** — direction label, type `QComboBox` (`arch | door | locked | trapped | secret | portcullis`), description `QLineEdit`. A type-dependent **extra row** rebuilds when the combo changes: `trapped` → "trap" line, `secret` → "hint" line, anything else → no extra row. Per-type values are cached in `_extra_cache` so flipping back restores the previous text. On apply, the irrelevant `trap`/`secret` keys are dropped from the door dict.
+- **Door bitmask sync** — when Apply detects a changed door type, the main window calls `cells.set_door_type(cell, name)` on the cell at `(door['row'], door['col'])` and re-renders the map (preserving zoom/pan via `Map_View.update_pixmap`).
 
 ## Cell Bitmask Encoding
 
