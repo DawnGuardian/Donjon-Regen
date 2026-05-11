@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -66,7 +67,7 @@ from PySide6.QtWidgets import (
 
 import cells as C
 from generate import generate_dungeon
-from renderer import render_map
+from renderer import render_map, RENDER_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -192,14 +193,17 @@ class Save_Worker(QThread):
     finished_ok = Signal(int, str)
     failed = Signal(str)
 
-    def __init__(self, dungeon: dict, out_dir: str, parent=None):
+    def __init__(self, dungeon: dict, out_dir: str, render_scale: int, parent=None):
         super().__init__(parent)
         self._dungeon = dungeon
         self._out_dir = out_dir
+        self._render_scale = render_scale
 
     def run(self):
         try:
-            generated = generate_dungeon(self._dungeon, self._out_dir)
+            generated = generate_dungeon(
+                self._dungeon, self._out_dir, render_scale=self._render_scale
+            )
             self.finished_ok.emit(len(generated), self._out_dir)
         except Exception as e:
             self.failed.emit(str(e))
@@ -799,6 +803,17 @@ class Donjon_Viewer(QMainWindow):
         fit_action.triggered.connect(lambda: self._map_view.fit_to_window())
         toolbar.addAction(fit_action)
 
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Scale: "))
+        self._scale_spin = QSpinBox()
+        self._scale_spin.setRange(1, 8)
+        self._scale_spin.setValue(RENDER_SCALE)
+        self._scale_spin.setToolTip(
+            "Render scale multiplier (applied to GM and player cell sizes)"
+        )
+        self._scale_spin.valueChanged.connect(self._on_scale_changed)
+        toolbar.addWidget(self._scale_spin)
+
         # Central splitter: map | details
         splitter = QSplitter(Qt.Horizontal)
         self.setCentralWidget(splitter)
@@ -862,7 +877,9 @@ class Donjon_Viewer(QMainWindow):
 
         self._dungeon = dungeon
         self._json_path = Path(path)
-        self._cell_size = dungeon["settings"]["cell_size"]
+        # Render at the toolbar's scale × the JSON's authoring cell_size;
+        # the same scaled value drives click-to-cell mapping inside Map_View.
+        self._cell_size = dungeon["settings"]["cell_size"] * self._scale_spin.value()
 
         cell_data = dungeon["cells"]
         n_rows = dungeon["settings"]["n_rows"]
@@ -883,9 +900,15 @@ class Donjon_Viewer(QMainWindow):
         )
 
     def _render_to_view(self) -> None:
-        pil_img = render_map(self._dungeon, gm_mode=True)
+        pil_img = render_map(self._dungeon, cell_size=self._cell_size, gm_mode=True)
         pixmap = pil_to_qpixmap(pil_img)
         self._map_view.update_pixmap(pixmap, self._cell_size)
+
+    def _on_scale_changed(self, value: int) -> None:
+        if self._dungeon is None:
+            return
+        self._cell_size = self._dungeon["settings"]["cell_size"] * value
+        self._render_to_view()
 
     # ------------------------------------------------------------------
     # Click handling
@@ -1017,7 +1040,7 @@ class Donjon_Viewer(QMainWindow):
         self._save_action.setEnabled(False)
         self._save_action.setText("Saving…")
 
-        worker = Save_Worker(self._dungeon, out_dir, self)
+        worker = Save_Worker(self._dungeon, out_dir, self._scale_spin.value(), self)
         worker.finished_ok.connect(self._on_save_finished)
         worker.failed.connect(self._on_save_failed)
         worker.finished.connect(self._on_save_done)

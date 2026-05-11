@@ -5,8 +5,14 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 import cells as C
+from gen_assets import door_symbol_rgba
 
 ASSETS_DIR = Path(__file__).parent / "assets"
+
+# Default render-resolution multiplier applied on top of the JSON's cell_size
+# (and the player map's base 50px). The doubled grid gives finer polygon edges,
+# better-scaled door symbols, and crisper labels at the cost of a 4× pixel area.
+RENDER_SCALE = 2
 
 # Colors
 BLACK = (0, 0, 0)
@@ -63,9 +69,7 @@ def room_polygon_vertices(room, cell_size):
 
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2
-    # Reference donjon output expands the inscribed circle radius by ~0.5px,
-    # so boundary pixel coverage matches the reference renderer.
-    radius = min(x2 - x1, y2 - y1) / 2 + 0.5
+    radius = min(x2 - x1, y2 - y1) / 2
 
     vertices = []
     for k in range(n_sides):
@@ -163,8 +167,8 @@ def render_map(dungeon, cell_size=None, gm_mode=True):
     _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
                     col_off, dungeon)
 
-    # Phase 3: Grid lines (polymorph edges are the natural anti-aliased
-    # boundary of the white fill — no explicit perimeter outline needed).
+    # Phase 3: Grid lines (polymorph perimeter is the natural sharp edge
+    # of the binary white fill — no explicit perimeter outline needed).
     _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms)
 
     # Phase 4: Doors, stairs, labels
@@ -197,24 +201,18 @@ def _fill_rooms(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
             draw.rectangle([x, y, x + cell_size, y + cell_size], fill=WHITE)
 
 
-# Supersampling factor for anti-aliased polymorph room rendering. The mask
-# is drawn at SCALE x resolution then downsampled with BILINEAR, so boundary
-# pixels receive partial white coverage proportional to the geometric shape's
-# overlap with the pixel — matching the donjon reference output.
-_POLYMORPH_AA_SCALE = 4
-
-
 def _fill_polymorph_rooms(img, rooms, cell_size):
-    """Draw polymorph rooms as anti-aliased geometric shapes (white fill).
+    """Draw polymorph rooms as binary white fills with sharp edges.
 
-    Boundary pixels along the polygon/circle edge receive grayscale values
-    based on sub-pixel coverage, so cells straddling the geometric boundary
-    are partially filled rather than all-or-nothing.
+    PIL's polygon/ellipse rasterizer paints whole pixels: every pixel center
+    inside the geometric shape becomes pure WHITE, every pixel center outside
+    stays as the existing background. The boundary is a single-pixel step —
+    no anti-aliased gradient, no soft edge — which gives the polygon a crisp
+    visible perimeter against the black background.
     """
-    scale = _POLYMORPH_AA_SCALE
     width, height = img.size
-    mask_hi = Image.new("L", (width * scale, height * scale), 0)
-    draw_hi = ImageDraw.Draw(mask_hi)
+    mask = Image.new("L", (width, height), 0)
+    draw_mask = ImageDraw.Draw(mask)
 
     drew_anything = False
     for room in rooms:
@@ -224,14 +222,12 @@ def _fill_polymorph_rooms(img, rooms, cell_size):
         if shape == "polygon":
             vertices = room_polygon_vertices(room, cell_size)
             if vertices:
-                hi_verts = [(x * scale, y * scale) for x, y in vertices]
-                draw_hi.polygon(hi_verts, fill=255)
+                draw_mask.polygon(vertices, fill=255)
                 drew_anything = True
         elif shape == "circle":
             cx, cy, radius = room_circle_params(room, cell_size)
-            draw_hi.ellipse(
-                [(cx - radius) * scale, (cy - radius) * scale,
-                 (cx + radius) * scale, (cy + radius) * scale],
+            draw_mask.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
                 fill=255,
             )
             drew_anything = True
@@ -239,10 +235,6 @@ def _fill_polymorph_rooms(img, rooms, cell_size):
     if not drew_anything:
         return
 
-    # BILINEAR / BOX gives clean averaging without LANCZOS ringing — important
-    # because corridor invasion uses pixel brightness to detect the polygon
-    # interior, and ringing artifacts would create false "interior" pixels.
-    mask = mask_hi.resize((width, height), Image.BILINEAR)
     white_layer = Image.new("RGB", (width, height), WHITE)
     img.paste(white_layer, (0, 0), mask)
 
@@ -292,9 +284,6 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
     }
 
     def _is_white(r, c):
-        # Brightness threshold: anti-aliased polygon edges produce near-black
-        # gray pixels just outside the geometric edge. Treat anything below
-        # mid-gray as "still outside" so corridor invasion can bridge the gap.
         px = c * cell_size + cell_size // 2
         py = r * cell_size + cell_size // 2
         if 0 <= px < img.width and 0 <= py < img.height:
@@ -316,8 +305,8 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
                 # Step into the room
                 r, c = r + dr, c + dc
                 # Always fill the first room cell adjacent to the door so
-                # the door tab bridges into the polygon even when the
-                # polygon's anti-aliased edge already covers part of it.
+                # the door tab bridges cleanly into the polygon, even when
+                # that cell is already inside the polygon shape.
                 first = True
                 while 0 <= r < n_rows and 0 <= c < n_cols:
                     if not first and _is_white(r, c):
@@ -343,14 +332,15 @@ def _fill_corridors(draw, img, cell_data, n_rows, n_cols, cell_size, row_off,
 def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
     """Draw grid lines based on rendered pixel state.
 
-    The reference renderer uses ONE color (GRID_COLOR) for every cell-edge
-    line touching an open cell — open/open and open/closed boundaries alike.
-    There is no separate "wall color"; walls are simply the black background
-    showing through where no open cell exists on either side.
+    GRID_COLOR is drawn on every cell-edge that touches an open cell — both
+    open/open and open/closed boundaries. Walls are simply the black
+    background showing through where no open cell exists on either side.
 
-    For polymorph rooms: draw ALL internal grid lines within the bbox, then
-    mask away any grid pixels that fall outside the white fill area (so the
-    smooth anti-aliased boundary is not recolored).
+    For polymorph rooms: Pass 2 redraws every internal bbox grid edge and
+    then reverts any grid pixel where the pre-grid snapshot was non-WHITE,
+    so grid lines only survive over the polygon's filled interior (and over
+    connector cells that the corridor invasion filled white before Pass 2's
+    snapshot was taken).
     """
     polymorph_cells = set()
     polymorph_rooms = []
@@ -386,6 +376,15 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
         )
 
     # --- Pass 1: Draw GRID_COLOR on every edge of every open cell ---
+    # Suppression rule: skip an edge only when BOTH adjacent cells live inside
+    # the same polymorph bbox — those purely-internal edges are reissued by
+    # Pass 2 (which masks them against the polygon's white interior). Edges
+    # at the bbox boundary still get drawn here, so connector cells (cells
+    # inside the bbox but outside the polygon shape, filled white by corridor
+    # invasion) keep their grid lines on the side that faces a corridor or
+    # other open cell outside the bbox. Pass 2's pre-Pass-1 snapshot reverts
+    # any pixels that fell on the polygon-exterior background, so polygon
+    # boundary edges remain clean.
     for row in range(n_rows):
         for col in range(n_cols):
             if not _pixel_is_open(row, col):
@@ -398,26 +397,26 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
             # Right edge
             rx = x + cell_size
             neighbor_in_poly = (row, col + 1) in polymorph_cells
-            if not (in_poly or neighbor_in_poly):
+            if not (in_poly and neighbor_in_poly):
                 draw.line([(rx, y), (rx, y + cell_size)], fill=GRID_COLOR)
 
             # Bottom edge
             by = y + cell_size
             neighbor_in_poly = (row + 1, col) in polymorph_cells
-            if not (in_poly or neighbor_in_poly):
+            if not (in_poly and neighbor_in_poly):
                 draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
 
             # Left edge — only if neighbor not open (open neighbor draws it
             # from its own right edge to avoid double-drawing)
             neighbor_open = col > 0 and _pixel_is_open(row, col - 1)
             neighbor_in_poly = (row, col - 1) in polymorph_cells
-            if not neighbor_open and not (in_poly or neighbor_in_poly):
+            if not neighbor_open and not (in_poly and neighbor_in_poly):
                 draw.line([(x, y), (x, y + cell_size)], fill=GRID_COLOR)
 
             # Top edge — same rule
             neighbor_open = row > 0 and _pixel_is_open(row - 1, col)
             neighbor_in_poly = (row - 1, col) in polymorph_cells
-            if not neighbor_open and not (in_poly or neighbor_in_poly):
+            if not neighbor_open and not (in_poly and neighbor_in_poly):
                 draw.line([(x, y), (x + cell_size, y)], fill=GRID_COLOR)
 
     # --- Pass 2: Polymorph grid lines — draw all, then mask to white area ---
@@ -444,9 +443,9 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
                     draw.line([(x, by), (x + cell_size, by)], fill=GRID_COLOR)
 
         # Mask: a grid pixel should only survive where the underlying fill
-        # was fully white. Black pixels (outside the polygon) and gray
-        # anti-aliased edge pixels both get reverted to their original value
-        # so the smooth boundary isn't recolored to grid gray.
+        # was fully white. Pixels outside the polygon were BLACK in the
+        # snapshot and get reverted, so the polygon's sharp boundary stays
+        # clean instead of being painted over with grid gray.
         pixels = img.load()
         region_pixels = region.load()
         for py in range(px_y1, min(px_y2, img.height)):
@@ -462,61 +461,35 @@ def _draw_grid(draw, img, n_rows, n_cols, cell_size, rooms):
 # Phase 4: Doors — asset-based rendering
 # ---------------------------------------------------------------------------
 
-# Cache for loaded and scaled door symbol images
-_door_asset_cache = {}
+# Cache for procedurally drawn door symbols, keyed by (name, size, orient).
+_door_symbol_cache = {}
 
 
-def _load_door_asset(name, cell_size, orient):
-    """Load a door symbol asset, scale to cell_size, and rotate for orientation.
+def _get_door_symbol(name, cell_size, orient):
+    """Return an RGBA door symbol drawn fresh at `cell_size` (cached).
 
-    The key.png symbols are drawn for a vertical wall (wall bars at top/bottom,
-    symbol opens left-right). For horizontal wall doors the asset is rotated 90°.
-
-    Returns a PIL Image with transparency (RGBA).
+    Symbols are rendered procedurally by `gen_assets.door_symbol_rgba` at the
+    exact target pixel size — no resampling, no anti-aliasing — so straight
+    lines stay straight and 1-pixel features stay crisp at any cell_size.
+    The base symbol is drawn for a vertical wall (stubs top/bottom); for
+    horizontal walls (north/south doors) it's rotated 90° clockwise.
     """
     cache_key = (name, cell_size, orient)
-    if cache_key in _door_asset_cache:
-        return _door_asset_cache[cache_key]
+    cached = _door_symbol_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    asset_path = ASSETS_DIR / f"{name}.png"
-    src = Image.open(asset_path).convert("RGBA")
-
-    # Make white pixels transparent so the symbol composites cleanly
-    pixels = src.load()
-    for y in range(src.height):
-        for x in range(src.width):
-            r, g, b, a = pixels[x, y]
-            if r > 200 and g > 200 and b > 200:
-                pixels[x, y] = (255, 255, 255, 0)
-
-    # Scale to cell_size x cell_size (LANCZOS preserves thin details like
-    # the locked door's center line and trapped door's cross bar)
-    scaled = src.resize((cell_size, cell_size), Image.LANCZOS)
-
-    # Threshold: LANCZOS produces anti-aliased grays. Snap pixels to either
-    # opaque black/gray or fully transparent so the symbol stays crisp.
-    sp = scaled.load()
-    for y in range(scaled.height):
-        for x in range(scaled.width):
-            r, g, b, a = sp[x, y]
-            if a < 64:
-                sp[x, y] = (0, 0, 0, 0)
-            else:
-                sp[x, y] = (r, g, b, 255)
-
-    # The asset shows a vertical wall orientation (wall at top/bottom).
-    # For horizontal wall doors (north/south), rotate 90° clockwise.
+    sym = door_symbol_rgba(name, cell_size)
     if orient == "horizontal":
-        scaled = scaled.rotate(-90, expand=True)
+        sym = sym.rotate(-90, expand=True)
 
-    _door_asset_cache[cache_key] = scaled
-    return scaled
-
+    _door_symbol_cache[cache_key] = sym
+    return sym
 
 
 def _draw_doors_on_img(img, cell_data, n_rows, n_cols, cell_size, row_off, col_off,
                        door_orient_map):
-    """Draw door symbols by pasting scaled assets onto the image directly."""
+    """Draw door symbols by compositing freshly-rendered RGBA glyphs."""
     for row in range(n_rows):
         for col in range(n_cols):
             cell = _cell(cell_data, row, col, row_off, col_off)
@@ -540,7 +513,7 @@ def _draw_doors_on_img(img, cell_data, n_rows, n_cols, cell_size, row_off, col_o
                 "secret": "secret",
             }.get(dt, "door")
 
-            asset = _load_door_asset(asset_name, cell_size, orient)
+            asset = _get_door_symbol(asset_name, cell_size, orient)
             img.paste(asset, (x, y), asset)  # use alpha channel as mask
 
 
@@ -648,18 +621,34 @@ def _draw_stair_down(draw, sx, sy, sw, sh, wall_w, direction):
 # Phase 4: Labels
 # ---------------------------------------------------------------------------
 
+_LABEL_FONT_CANDIDATES = (
+    # Serifed monospace fonts, in preference order. Courier is the classic
+    # typewriter face; Courier New is the Microsoft-licensed equivalent that
+    # ships under macOS Supplemental. The default is the last-resort fallback.
+    "/System/Library/Fonts/Courier.ttc",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/Library/Fonts/Courier New.ttf",
+)
+
+
+def _load_label_font(font_size):
+    for path in _LABEL_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, font_size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
 def _draw_labels(draw, cell_data, n_rows, n_cols, cell_size, row_off, col_off):
     """Draw room numbers and corridor feature labels on the map.
 
-    Uses 1-bit (aliased) font rendering so glyph edges are crisp pure-black
-    pixels rather than the grayscale anti-aliased pixels the donjon reference
-    produces.
+    Uses a serifed monospace font (Courier) and 1-bit (aliased) glyph
+    rendering so each character has a uniform width and crisp pure-black
+    edges rather than grayscale anti-aliased ones.
     """
-    try:
-        font_size = max(8, cell_size - 4)
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
+    font_size = max(8, cell_size - 4)
+    font = _load_label_font(font_size)
 
     draw.fontmode = "1"
 

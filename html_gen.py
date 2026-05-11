@@ -8,12 +8,18 @@ import cells as C
 from renderer import room_polygon_vertices, room_circle_params
 
 
-def generate_html(dungeon, gm_img):
-    """Generate the complete HTML document for the dungeon."""
+def generate_html(dungeon, gm_img, cell_size=None):
+    """Generate the complete HTML document for the dungeon.
+
+    `cell_size` is the pixel pitch the embedded GM image was rendered at —
+    image-map coordinates need to match it. When omitted, falls back to the
+    JSON's authoring cell_size for backwards compatibility (older callers).
+    """
     settings = dungeon["settings"]
     name = settings["name"]
     level = settings.get("level", "1")
-    cell_size = settings["cell_size"]
+    if cell_size is None:
+        cell_size = settings["cell_size"]
 
     # Encode map image as base64
     map_b64 = _img_to_base64(gm_img)
