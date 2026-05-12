@@ -9,6 +9,11 @@ Symbol orientation: vertical wall (wall stubs at top/bottom center, symbol
 opens left-right). The renderer rotates 90° at composite time for horizontal
 walls. Symbols are drawn black-on-white; `door_symbol_rgba` post-processes to
 black-on-transparent for compositing.
+
+Stroke scaling: thin interior features (door panel outline, S-glyph strokes,
+locked/trapped/portcullis bars) scale linearly from 1px at the 19×19
+reference (via `_stroke(size)`), so symbols stay readable at any cell_size
+instead of degrading to hairlines against the thicker stubs.
 """
 
 from PIL import Image, ImageDraw
@@ -34,10 +39,25 @@ def _scale(base_value, size):
 
 
 def _odd(n):
-    """Force `n` to the nearest odd integer >= 1 so centered features are
-    pixel-symmetric (a 4-px-wide bar can't be centered on a single column)."""
+    """Force `n` to the nearest odd integer >= 1 (rounding down) so centered
+    features are pixel-symmetric (a 4-px-wide bar can't be centered on a
+    single column)."""
     n = max(1, n)
     return n if n % 2 == 1 else n - 1
+
+
+def _odd_at_least(n):
+    """Smallest odd integer >= n (and >= 1). Use for stroke widths that must
+    stay pixel-symmetric around a center; rounding up keeps the stroke
+    visible rather than collapsing to the next-thinner odd value."""
+    n = max(1, n)
+    return n if n % 2 == 1 else n + 1
+
+
+def _stroke(size):
+    """Thin-feature stroke thickness for a symbol drawn at `size`. Linear
+    scale from 1px at the 19×19 reference."""
+    return _scale(1, size)
 
 
 def _wall_stub_v(draw, w, h, stub_h, bar_w):
@@ -48,6 +68,20 @@ def _wall_stub_v(draw, w, h, stub_h, bar_w):
     x2 = x1 + bar_w - 1
     draw.rectangle([x1, 0, x2, stub_h - 1], fill=BLACK)
     draw.rectangle([x1, h - stub_h, x2, h - 1], fill=BLACK)
+
+
+def _vbar_c(draw, cx, y1, y2, stroke):
+    """Vertical bar of width `stroke` centered on column `cx`, from y1..y2
+    inclusive. Pass an odd `stroke` for pixel-symmetric centering."""
+    half = stroke // 2
+    draw.rectangle([cx - half, y1, cx + stroke - half - 1, y2], fill=BLACK)
+
+
+def _hbar_c(draw, cy, x1, x2, stroke):
+    """Horizontal bar of height `stroke` centered on row `cy`, from x1..x2
+    inclusive. Pass an odd `stroke` for pixel-symmetric centering."""
+    half = stroke // 2
+    draw.rectangle([x1, cy - half, x2, cy + stroke - half - 1], fill=BLACK)
 
 
 # --- Generator functions ---------------------------------------------------
@@ -70,6 +104,7 @@ def gen_portcullis(size=DOOR_BASE_SIZE):
     img, draw = _new(size, size)
     bar_w = _odd(_scale(3, size))
     stub_h = _scale(5, size)
+    stroke_c = _odd_at_least(_stroke(size))
     _wall_stub_v(draw, size, size, stub_h, bar_w)
 
     cx = size // 2
@@ -79,22 +114,24 @@ def gen_portcullis(size=DOOR_BASE_SIZE):
         return img
     gap_h = gap_bottom - gap_top + 1
 
-    # Continuous thin vertical line through the gap center
-    draw.line([(cx, gap_top), (cx, gap_bottom)], fill=BLACK)
+    # Continuous vertical line through the gap center
+    _vbar_c(draw, cx, gap_top, gap_bottom, stroke_c)
 
-    # Three horizontal dashes at 1/4, 1/2, 3/4 of the gap; same width as the
-    # wall stubs so the dashes read as bars of the portcullis.
+    # Three horizontal dashes at 1/4, 1/2, 3/4 of the gap; same horizontal
+    # span as the wall stubs so the dashes read as bars of the portcullis.
     dash_w = bar_w
     dx = dash_w // 2
     for frac in (0.25, 0.5, 0.75):
         y = gap_top + round(frac * (gap_h - 1))
-        draw.line([(cx - dx, y), (cx + dx, y)], fill=BLACK)
+        _hbar_c(draw, y, cx - dx, cx + dx, stroke_c)
     return img
 
 
-def _draw_door_rect(draw, size, m):
-    """Draw the standard 1px door panel rectangle outline at margin `m`."""
-    draw.rectangle([m, m, size - m - 1, size - m - 1], outline=BLACK)
+def _draw_door_rect(draw, size, m, stroke):
+    """Door panel rectangle outline at margin `m`, outline thickness `stroke`
+    (PIL thickens the outline inward from the bbox edge)."""
+    draw.rectangle([m, m, size - m - 1, size - m - 1],
+                   outline=BLACK, width=stroke)
 
 
 def gen_door(size=DOOR_BASE_SIZE):
@@ -102,8 +139,9 @@ def gen_door(size=DOOR_BASE_SIZE):
     img, draw = _new(size, size)
     bar_w = _odd(_scale(3, size))
     stub_h = _scale(4, size)
+    stroke = _stroke(size)
     _wall_stub_v(draw, size, size, stub_h, bar_w)
-    _draw_door_rect(draw, size, stub_h)
+    _draw_door_rect(draw, size, stub_h, stroke)
     return img
 
 
@@ -112,39 +150,50 @@ def gen_locked(size=DOOR_BASE_SIZE):
     img, draw = _new(size, size)
     bar_w = _odd(_scale(3, size))
     stub_h = _scale(4, size)
+    stroke = _stroke(size)
+    stroke_c = _odd_at_least(stroke)
     _wall_stub_v(draw, size, size, stub_h, bar_w)
-    _draw_door_rect(draw, size, stub_h)
+    _draw_door_rect(draw, size, stub_h, stroke)
     cx = size // 2
-    draw.line([(cx, stub_h), (cx, size - stub_h - 1)], fill=BLACK)
+    _vbar_c(draw, cx, stub_h, size - stub_h - 1, stroke_c)
     return img
 
 
 def gen_trapped(size=DOOR_BASE_SIZE):
     """Door panel + a horizontal bar through the panel center, extending
-    one line-thickness beyond the panel on each side."""
+    one stroke-thickness beyond the panel on each side."""
     img, draw = _new(size, size)
     bar_w = _odd(_scale(3, size))
     stub_h = _scale(4, size)
+    stroke = _stroke(size)
+    stroke_c = _odd_at_least(stroke)
     _wall_stub_v(draw, size, size, stub_h, bar_w)
-    _draw_door_rect(draw, size, stub_h)
+    _draw_door_rect(draw, size, stub_h, stroke)
     cy = size // 2
-    extend = max(1, _scale(1, size))
-    draw.line([(stub_h - extend, cy), (size - stub_h + extend - 1, cy)],
-              fill=BLACK)
+    extend = stroke
+    _hbar_c(draw, cy, stub_h - extend, size - stub_h + extend - 1, stroke_c)
     return img
 
 
 def gen_secret(size=DOOR_BASE_SIZE):
-    """Wall stubs + connector pixels + an angular `S` glyph in the gap."""
+    """Wall stubs + connector marks + an angular `S` glyph in the gap."""
     img, draw = _new(size, size)
     bar_w = _odd(_scale(3, size))
     stub_h = _scale(5, size)
+    stroke = _stroke(size)
+    stroke_c = _odd_at_least(stroke)
     _wall_stub_v(draw, size, size, stub_h, bar_w)
 
     cx = size // 2
-    # Single-pixel connector marks at the inner edge of each stub
-    img.putpixel((cx, stub_h), BLACK)
-    img.putpixel((cx, size - stub_h - 1), BLACK)
+    # Centered connector marks at the inner edge of each stub, bridging
+    # stub → S region. stroke_c × stroke_c squares centered on cx.
+    half = stroke_c // 2
+    draw.rectangle([cx - half, stub_h,
+                    cx + stroke_c - half - 1, stub_h + stroke_c - 1],
+                   fill=BLACK)
+    draw.rectangle([cx - half, size - stub_h - stroke_c,
+                    cx + stroke_c - half - 1, size - stub_h - 1],
+                   fill=BLACK)
 
     # S-glyph inside the gap, scaled from the original 19×19 design (which
     # places the S at margin=6 horizontally, with one row of padding above
@@ -159,11 +208,14 @@ def gen_secret(size=DOOR_BASE_SIZE):
         return img  # too small to render the S — leave just the stubs
     scy = (sy1 + sy2) // 2
 
-    draw.line([(sx1, sy1), (sx2, sy1)], fill=BLACK)  # top bar
-    draw.line([(sx1, sy1), (sx1, scy)], fill=BLACK)  # left top
-    draw.line([(sx1, scy), (sx2, scy)], fill=BLACK)  # middle bar
-    draw.line([(sx2, scy), (sx2, sy2)], fill=BLACK)  # right bottom
-    draw.line([(sx1, sy2), (sx2, sy2)], fill=BLACK)  # bottom bar
+    # Edge strokes thicken inward (their outer edge sits on the S bbox);
+    # the middle bar is centered on scy and uses the odd stroke variant
+    # to stay pixel-symmetric.
+    draw.rectangle([sx1, sy1, sx2, sy1 + stroke - 1], fill=BLACK)    # top
+    draw.rectangle([sx1, sy1, sx1 + stroke - 1, scy], fill=BLACK)    # left-top
+    _hbar_c(draw, scy, sx1, sx2, stroke_c)                           # middle
+    draw.rectangle([sx2 - stroke + 1, scy, sx2, sy2], fill=BLACK)    # right-bot
+    draw.rectangle([sx1, sy2 - stroke + 1, sx2, sy2], fill=BLACK)    # bottom
     return img
 
 
