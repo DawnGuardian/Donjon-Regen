@@ -10,6 +10,7 @@ Donjon-Regen/           # Project root — all source lives here
   generate.py           # Shared generation logic (used by CLI and GUI)
   gui.py                # PySide6 GUI (viewer-first)
   cells.py              # Cell bitmask constants & helper functions
+  dungeon_ops.py        # Pure mutations on the dungeon dict (resize / paint / erase / etc.)
   renderer.py           # PIL-based map renderer (GM & player maps)
   html_gen.py           # HTML generator (embedded map, image map areas, detail tables)
   table_gen.py          # Tabular grid export (TSV + CSV via shared writer)
@@ -65,9 +66,27 @@ rendering and scripted batch jobs.
 
 ## GUI (gui.py)
 
-PySide6-based viewer/editor. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / Fit to Window), a horizontal `QSplitter` containing a `Map_View` (left) and a `QStackedWidget` details panel (right), and a status bar.
+PySide6-based viewer/editor. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / tool selector / structural-edit actions / Fit / Scale spinbox), a horizontal `QSplitter` containing a `Map_View` (left) and a `QStackedWidget` details panel (right), and a status bar.
 
-- **`Map_View`** — `QGraphicsView` subclass. Mouse wheel zooms (anchored under cursor), middle-button drag pans, left-click emits `cell_clicked(row, col)`. Click coords are mapped to scene coords then divided by `cell_size` to get the cell. `update_pixmap(pixmap, cell_size)` re-renders without resetting zoom/pan; the `cell_size` arg is required on first load (the view's internal `_cell_size` defaults to 1).
+### Toolbar
+
+- **Tool selector** — exclusive `QActionGroup` of checkable actions: `Select` (default) / `Corridor` / `Room` / `Eraser`. Tool tokens live as module constants (`TOOL_SELECT`, `TOOL_CORRIDOR`, `TOOL_ROOM`, `TOOL_ERASER`). Cursor shape changes per tool via `Map_View.set_tool`.
+- **Structural-edit actions** — `Resize Canvas…` (4-direction signed deltas) and `Mirror Rooms…` (Phase 5 stub). These are one-shot dialog actions, not tool modes.
+
+### Map_View tool behavior
+
+- **`select`** — left-click emits `cell_clicked(row, col)` (existing viewer/edit-details behavior).
+- **`corridor` / `eraser`** — left-press + drag emits `cell_painted(row, col, tool)` per *new* cell entered (deduped against the last painted cell); on release emits `paint_stroke_ended(tool)`. The main window mutates the dungeon dict immediately for each `cell_painted` event (via `dungeon_ops.paint_corridor` / `erase_cell`) but defers the re-render until `paint_stroke_ended` so a long drag doesn't trigger N re-renders.
+- **`room`** — left-press starts a live rectangle preview (`QGraphicsRectItem` with a translucent fill). Drag updates the rect; release emits `rect_drawn(north, south, west, east)` in map coords and clears the preview. Phase 3 will wire this to room creation; current handler is a status-bar stub.
+- `update_pixmap(pixmap, cell_size)` re-renders without resetting zoom/pan; the `cell_size` arg is required on first load (the view's internal `_cell_size` defaults to 1).
+
+### dungeon_ops.py
+
+Pure mutations on the in-memory dungeon dict. Each op keeps invariants consistent (`cells` ↔ `rooms` metadata, `settings.n_rows/n_cols`, padding) so the next render is correct. After any structural op the `cells` 2D array is normalised so `len(cells) == n_rows`, `len(cells[0]) == n_cols` (i.e., the cells-array padding offset becomes 0). The main window's `_after_dungeon_mutated()` recomputes its cached `_row_off / _col_off` and re-renders.
+
+- **`paint_corridor(d, row, col)`** — set `CORRIDOR` bit, preserve any existing label char. Refuses to overwrite a room cell.
+- **`erase_cell(d, row, col)`** — reset to `NOTHING`. Does NOT update room metadata: erasing room-interior cells leaves the room bbox in the dict inconsistent with the rendered fill — use the (forthcoming) `delete_room` op for full removal.
+- **`resize_canvas(d, n_add, s_add, e_add, w_add, *, force=False)`** — positive deltas grow that edge, negative deltas shrink. Coordinates shift so existing content stays anchored (e.g., `n_add=5` pushes every row index by +5). Pre-flights which rooms / stairs would fall outside the new bounds and raises `Canvas_Resize_Conflict` with the victim list unless `force=True`. Also shifts: room bbox / row / col, room.doors[*].row/col, stairs, corridor_features marks, egress entries. Settings (`n_rows`, `n_cols`, `max_row`, `max_col`, `n_rooms`) are updated.
 - **Details panel** — `QStackedWidget` with two pages: page 0 = simple read-only `QLabel`+`QTextEdit` (corridors, doors, wall/wandering); page 1 = `Room_Editor`.
 - **Click resolution** — based on the cell bitmask: room → `Room_Editor` for `rooms[id]`; corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
 - **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker`) so the UI stays responsive.

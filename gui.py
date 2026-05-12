@@ -30,6 +30,9 @@ from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
+    QBrush,
+    QColor,
     QImage,
     QKeySequence,
     QPainter,
@@ -39,6 +42,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -66,8 +71,20 @@ from PySide6.QtWidgets import (
 )
 
 import cells as C
+import dungeon_ops
 from generate import generate_dungeon
 from renderer import render_map, RENDER_SCALE
+
+
+# Tool modes for Map_View. Modes change how mouse events are interpreted:
+#   select   → click to view/edit cell details (existing viewer behavior)
+#   corridor → click/drag paints CORRIDOR cells
+#   room     → click/drag draws a rectangle; release emits the bounds
+#   eraser   → click/drag clears open-space bits / removes content
+TOOL_SELECT = "select"
+TOOL_CORRIDOR = "corridor"
+TOOL_ROOM = "room"
+TOOL_ERASER = "eraser"
 
 
 # ---------------------------------------------------------------------------
@@ -103,10 +120,35 @@ def _hr() -> QFrame:
 # ---------------------------------------------------------------------------
 
 class Map_View(QGraphicsView):
-    """A QGraphicsView with mouse-wheel zoom, middle-button pan, and
-    a `cell_clicked` signal emitting (row, col) on left-click."""
+    """QGraphicsView with mouse-wheel zoom, middle-button pan, and tool-aware
+    left-button interaction.
+
+    Signals depend on the active tool:
+      * `select`              → `cell_clicked(row, col)` on each click.
+      * `corridor` / `eraser` → `cell_painted(row, col, tool)` per cell
+        entered while the left button is held, then `paint_stroke_ended(tool)`
+        on release (the host re-renders once per stroke, not per cell).
+      * `room`                → live rectangle preview during drag; on release
+        emit `rect_drawn(north, south, west, east)` with the bbox in map
+        coordinates.
+
+    Cursor shape is updated by `set_tool` to reflect what the next click does.
+    """
 
     cell_clicked = Signal(int, int)
+    cell_painted = Signal(int, int, str)
+    paint_stroke_ended = Signal(str)
+    rect_drawn = Signal(int, int, int, int)
+
+    _TOOL_CURSORS = {
+        TOOL_SELECT: Qt.ArrowCursor,
+        TOOL_CORRIDOR: Qt.CrossCursor,
+        TOOL_ROOM: Qt.CrossCursor,
+        TOOL_ERASER: Qt.PointingHandCursor,
+    }
+
+    _PREVIEW_PEN_COLOR = QColor(0, 160, 255)
+    _PREVIEW_FILL_COLOR = QColor(0, 160, 255, 60)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -124,9 +166,16 @@ class Map_View(QGraphicsView):
         self._highlight: QGraphicsRectItem | None = None
         self._cell_size = 1
 
+        self._tool = TOOL_SELECT
+        self._drag_active = False
+        self._drag_start_cell: tuple[int, int] | None = None
+        self._last_painted_cell: tuple[int, int] | None = None
+        self._preview_rect: QGraphicsRectItem | None = None
+
     def set_map(self, pixmap: QPixmap, cell_size: int) -> None:
         self._scene.clear()
         self._highlight = None
+        self._preview_rect = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self._cell_size = cell_size
@@ -161,6 +210,38 @@ class Map_View(QGraphicsView):
         else:
             self._highlight.setRect(rect)
 
+    # -- tool control ------------------------------------------------------
+
+    def set_tool(self, tool: str) -> None:
+        if tool not in self._TOOL_CURSORS:
+            tool = TOOL_SELECT
+        self._tool = tool
+        self._cancel_drag_state()
+        self.viewport().setCursor(self._TOOL_CURSORS[tool])
+
+    def current_tool(self) -> str:
+        return self._tool
+
+    def _cancel_drag_state(self) -> None:
+        if self._preview_rect is not None:
+            self._scene.removeItem(self._preview_rect)
+            self._preview_rect = None
+        self._drag_active = False
+        self._drag_start_cell = None
+        self._last_painted_cell = None
+
+    def _cell_from_event(self, event) -> tuple[int, int]:
+        scene_pos: QPointF = self.mapToScene(event.position().toPoint())
+        col = int(scene_pos.x() // self._cell_size)
+        row = int(scene_pos.y() // self._cell_size)
+        return row, col
+
+    def _bbox_rect(self, r0: int, c0: int, r1: int, c1: int) -> QRectF:
+        cs = self._cell_size
+        n, s = min(r0, r1), max(r0, r1)
+        w, e = min(c0, c1), max(c0, c1)
+        return QRectF(w * cs, n * cs, (e - w + 1) * cs, (s - n + 1) * cs)
+
     def wheelEvent(self, event):
         if self._pixmap_item is None:
             super().wheelEvent(event)
@@ -173,16 +254,83 @@ class Map_View(QGraphicsView):
 
     def mousePressEvent(self, event):
         if (
-            event.button() == Qt.LeftButton
-            and self._pixmap_item is not None
-            and self._cell_size > 0
+            event.button() != Qt.LeftButton
+            or self._pixmap_item is None
+            or self._cell_size <= 0
         ):
-            scene_pos: QPointF = self.mapToScene(event.position().toPoint())
-            col = int(scene_pos.x() // self._cell_size)
-            row = int(scene_pos.y() // self._cell_size)
+            super().mousePressEvent(event)
+            return
+
+        row, col = self._cell_from_event(event)
+
+        if self._tool == TOOL_SELECT:
             self.cell_clicked.emit(row, col)
             return
+
+        if self._tool in (TOOL_CORRIDOR, TOOL_ERASER):
+            self._drag_active = True
+            self._last_painted_cell = (row, col)
+            self.cell_painted.emit(row, col, self._tool)
+            return
+
+        if self._tool == TOOL_ROOM:
+            self._drag_active = True
+            self._drag_start_cell = (row, col)
+            pen = QPen(self._PREVIEW_PEN_COLOR)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            brush = QBrush(self._PREVIEW_FILL_COLOR)
+            self._preview_rect = self._scene.addRect(
+                self._bbox_rect(row, col, row, col), pen, brush
+            )
+            self._preview_rect.setZValue(15)
+            return
+
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._drag_active or self._pixmap_item is None:
+            super().mouseMoveEvent(event)
+            return
+
+        row, col = self._cell_from_event(event)
+
+        if self._tool in (TOOL_CORRIDOR, TOOL_ERASER):
+            if (row, col) == self._last_painted_cell:
+                return
+            self._last_painted_cell = (row, col)
+            self.cell_painted.emit(row, col, self._tool)
+            return
+
+        if self._tool == TOOL_ROOM and self._preview_rect is not None:
+            r0, c0 = self._drag_start_cell
+            self._preview_rect.setRect(self._bbox_rect(r0, c0, row, col))
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or not self._drag_active:
+            super().mouseReleaseEvent(event)
+            return
+
+        if self._tool in (TOOL_CORRIDOR, TOOL_ERASER):
+            tool = self._tool
+            self._drag_active = False
+            self._last_painted_cell = None
+            self.paint_stroke_ended.emit(tool)
+            return
+
+        if self._tool == TOOL_ROOM and self._drag_start_cell is not None:
+            row, col = self._cell_from_event(event)
+            r0, c0 = self._drag_start_cell
+            n, s = min(r0, row), max(r0, row)
+            w, e = min(c0, col), max(c0, col)
+            self._cancel_drag_state()
+            self.rect_drawn.emit(n, s, w, e)
+            return
+
+        super().mouseReleaseEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +946,48 @@ class Donjon_Viewer(QMainWindow):
 
         toolbar.addSeparator()
 
+        # Edit-tool selector — exclusive checkable group. Default = Select
+        # (preserves the prior viewer behavior).
+        tool_group = QActionGroup(self)
+        tool_group.setExclusive(True)
+        self._tool_actions: dict[str, QAction] = {}
+        for tool_id, label, tooltip in (
+            (TOOL_SELECT, "Select", "View / edit cell details (default)"),
+            (TOOL_CORRIDOR, "Corridor", "Click or drag to paint corridor tiles"),
+            (TOOL_ROOM, "Room", "Click-and-drag to draw a new room rectangle"),
+            (TOOL_ERASER, "Eraser", "Click or drag to clear tiles"),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setToolTip(tooltip)
+            act.setEnabled(False)
+            act.triggered.connect(lambda _checked=False, t=tool_id: self._set_tool(t))
+            tool_group.addAction(act)
+            toolbar.addAction(act)
+            self._tool_actions[tool_id] = act
+        self._tool_actions[TOOL_SELECT].setChecked(True)
+
+        toolbar.addSeparator()
+
+        # Structural-edit actions (one-shot dialogs, not tool modes).
+        self._resize_canvas_action = QAction("Resize Canvas…", self)
+        self._resize_canvas_action.setEnabled(False)
+        self._resize_canvas_action.setToolTip(
+            "Grow or shrink the dungeon canvas by per-edge cell deltas"
+        )
+        self._resize_canvas_action.triggered.connect(self._on_resize_canvas)
+        toolbar.addAction(self._resize_canvas_action)
+
+        self._mirror_action = QAction("Mirror Rooms…", self)
+        self._mirror_action.setEnabled(False)
+        self._mirror_action.setToolTip(
+            "Mirror all rooms across an axis (overwrite mode — destination rooms are replaced)"
+        )
+        self._mirror_action.triggered.connect(self._on_mirror_rooms)
+        toolbar.addAction(self._mirror_action)
+
+        toolbar.addSeparator()
+
         fit_action = QAction("Fit to Window", self)
         fit_action.setShortcut(QKeySequence("Ctrl+0"))
         fit_action.triggered.connect(lambda: self._map_view.fit_to_window())
@@ -820,6 +1010,9 @@ class Donjon_Viewer(QMainWindow):
 
         self._map_view = Map_View()
         self._map_view.cell_clicked.connect(self._on_cell_clicked)
+        self._map_view.cell_painted.connect(self._on_cell_painted)
+        self._map_view.paint_stroke_ended.connect(self._on_paint_stroke_ended)
+        self._map_view.rect_drawn.connect(self._on_rect_drawn)
         splitter.addWidget(self._map_view)
 
         # Right-side details: stacked simple-view / room-editor
@@ -891,6 +1084,13 @@ class Donjon_Viewer(QMainWindow):
         self.setWindowTitle(f"Donjon Regen — {name}")
         self.statusBar().showMessage(f"Loaded: {name}  ({n_cols}×{n_rows})")
         self._save_action.setEnabled(True)
+        self._resize_canvas_action.setEnabled(True)
+        self._mirror_action.setEnabled(True)
+        for act in self._tool_actions.values():
+            act.setEnabled(True)
+        # Reset to Select tool on every load.
+        self._tool_actions[TOOL_SELECT].setChecked(True)
+        self._map_view.set_tool(TOOL_SELECT)
 
         self._render_to_view()
 
@@ -1022,6 +1222,167 @@ class Donjon_Viewer(QMainWindow):
             if not (0 <= cr < len(cells_arr) and 0 <= cc < len(cells_arr[0])):
                 continue
             cells_arr[cr][cc] = C.set_door_type(cells_arr[cr][cc], door["type"])
+
+    # ------------------------------------------------------------------
+    # Editing tools: brush / room-rect / structural ops
+    # ------------------------------------------------------------------
+
+    def _set_tool(self, tool: str) -> None:
+        """Switch the Map_View's active tool. Also clears the cell-highlight
+        rectangle so it doesn't sit on top of brush strokes."""
+        self._map_view.set_tool(tool)
+        # Select keeps the highlight, the others don't need it cluttering paint.
+        if tool != TOOL_SELECT and self._map_view._highlight is not None:
+            self._map_view._highlight.setVisible(False)
+        elif tool == TOOL_SELECT and self._map_view._highlight is not None:
+            self._map_view._highlight.setVisible(True)
+        self.statusBar().showMessage(f"Tool: {tool}", 2000)
+
+    def _on_cell_painted(self, row: int, col: int, tool: str) -> None:
+        """One step of a brush stroke — mutate the cell but defer re-rendering
+        until the stroke ends, so a long drag doesn't trigger N re-renders."""
+        if self._dungeon is None:
+            return
+        if tool == TOOL_CORRIDOR:
+            dungeon_ops.paint_corridor(self._dungeon, row, col)
+        elif tool == TOOL_ERASER:
+            dungeon_ops.erase_cell(self._dungeon, row, col)
+
+    def _on_paint_stroke_ended(self, tool: str) -> None:
+        """Re-render once at the end of a brush stroke."""
+        if self._dungeon is None:
+            return
+        self._render_to_view()
+        self.statusBar().showMessage(f"Stroke applied ({tool}).", 2000)
+
+    def _on_rect_drawn(self, north: int, south: int, west: int, east: int) -> None:
+        """Room-rect tool released. Phase 3 will turn this into an actual
+        room-creation flow; for now it just reports the bounds."""
+        if self._dungeon is None:
+            return
+        self.statusBar().showMessage(
+            f"(room create not implemented yet) bounds: rows {north}-{south}, "
+            f"cols {west}-{east}",
+            4000,
+        )
+
+    def _after_dungeon_mutated(self) -> None:
+        """Re-sync derived state after a structural op (resize, mirror, …)
+        and re-render. The cells array is normalised by `dungeon_ops`, so
+        the row/col offsets are 0 — but we still recompute defensively in
+        case a future op leaves padding in place."""
+        cells_arr = self._dungeon["cells"]
+        n_rows = self._dungeon["settings"]["n_rows"]
+        n_cols = self._dungeon["settings"]["n_cols"]
+        self._row_off = (len(cells_arr) - n_rows) // 2
+        self._col_off = (len(cells_arr[0]) - n_cols) // 2
+        self._render_to_view()
+
+    def _on_resize_canvas(self) -> None:
+        """Open the 4-direction resize dialog and apply the result. Negative
+        deltas shrink that edge; if the shrink would discard rooms or stairs
+        we ask the user to confirm first."""
+        if self._dungeon is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resize Canvas")
+        outer = QVBoxLayout(dialog)
+        outer.addWidget(QLabel(
+            "Add (positive) or remove (negative) rows / cols on each edge.\n"
+            "Existing content stays anchored — adding to the north pushes\n"
+            "every coordinate south."
+        ))
+
+        form = QFormLayout()
+        outer.addLayout(form)
+
+        def _signed_spin(initial: int = 0) -> QSpinBox:
+            s = QSpinBox()
+            s.setRange(-512, 512)
+            s.setValue(initial)
+            return s
+
+        n_spin = _signed_spin()
+        s_spin = _signed_spin()
+        w_spin = _signed_spin()
+        e_spin = _signed_spin()
+        form.addRow("North Δ rows:", n_spin)
+        form.addRow("South Δ rows:", s_spin)
+        form.addRow("West Δ cols:",  w_spin)
+        form.addRow("East Δ cols:",  e_spin)
+
+        current = QLabel(
+            f"Current size: {self._dungeon['settings']['n_cols']} "
+            f"× {self._dungeon['settings']['n_rows']} (cols × rows)"
+        )
+        current.setStyleSheet("color: #666;")
+        outer.addWidget(current)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        n_add = n_spin.value()
+        s_add = s_spin.value()
+        w_add = w_spin.value()
+        e_add = e_spin.value()
+        if (n_add, s_add, w_add, e_add) == (0, 0, 0, 0):
+            return
+
+        try:
+            report = dungeon_ops.resize_canvas(
+                self._dungeon, n_add, s_add, e_add, w_add
+            )
+        except dungeon_ops.Canvas_Resize_Conflict as conflict:
+            lines = ["Shrinking will permanently discard:"]
+            if conflict.dropped_rooms:
+                ids = ", ".join(
+                    str(r.get("id", "?")) for r in conflict.dropped_rooms
+                )
+                lines.append(f"  • Rooms: {ids}")
+            if conflict.dropped_stairs:
+                lines.append(f"  • {len(conflict.dropped_stairs)} stair(s)")
+            lines.append("")
+            lines.append("Continue anyway?")
+            choice = QMessageBox.warning(
+                self,
+                "Confirm shrink",
+                "\n".join(lines),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+            report = dungeon_ops.resize_canvas(
+                self._dungeon, n_add, s_add, e_add, w_add, force=True
+            )
+        except ValueError as e:
+            QMessageBox.critical(self, "Invalid size", str(e))
+            return
+
+        self._after_dungeon_mutated()
+        new_rows = self._dungeon["settings"]["n_rows"]
+        new_cols = self._dungeon["settings"]["n_cols"]
+        msg = f"Canvas resized to {new_cols}×{new_rows}"
+        if report["dropped_rooms"] or report["dropped_stairs"]:
+            msg += (
+                f" (dropped {len(report['dropped_rooms'])} room(s), "
+                f"{len(report['dropped_stairs'])} stair(s))"
+            )
+        self.statusBar().showMessage(msg, 6000)
+
+    def _on_mirror_rooms(self) -> None:
+        """Phase 5 stub — mirror dialog & op not implemented yet."""
+        QMessageBox.information(
+            self,
+            "Mirror Rooms",
+            "Mirror is coming in the next phase of the editor expansion.",
+        )
 
     # ------------------------------------------------------------------
     # Save outputs
