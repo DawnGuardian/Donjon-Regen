@@ -661,14 +661,26 @@ class Door_Row(QWidget):
 # ---------------------------------------------------------------------------
 
 class Room_Editor(QWidget):
-    """Structured editor for a single room. `apply_clicked` is emitted with
-    `(room, doors_with_type_change)` when the user clicks Apply."""
+    """Structured editor for a single room.
 
-    apply_clicked = Signal(dict, list)
+    `apply_clicked(room, changed_doors, geometry_changed)` is emitted when
+    the user clicks Apply — `changed_doors` is the list of door dicts whose
+    type changed (so the main window can update their cell bits), and
+    `geometry_changed` is True if `reshape_room` or `resize_room` actually
+    modified anything on this apply (so the main window can re-render and,
+    in the resize case, refresh its row/col offsets).
+
+    `delete_clicked(room)` fires when the user clicks the Delete Room button
+    — the main window confirms and dispatches to `dungeon_ops.delete_room`.
+    """
+
+    apply_clicked = Signal(dict, list, bool)
+    delete_clicked = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._room: dict | None = None
+        self._dungeon: dict | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -691,6 +703,10 @@ class Room_Editor(QWidget):
         # Bottom button row
         button_row = QHBoxLayout()
         button_row.setContentsMargins(8, 4, 8, 8)
+        self._delete_btn = QPushButton("Delete Room")
+        self._delete_btn.setStyleSheet("color: #a40000;")
+        self._delete_btn.clicked.connect(self._on_delete)
+        button_row.addWidget(self._delete_btn)
         button_row.addStretch(1)
         self._apply_btn = QPushButton("Apply Changes")
         self._apply_btn.clicked.connect(self._on_apply)
@@ -702,11 +718,21 @@ class Room_Editor(QWidget):
         self._inhabited_edit: QLineEdit | None = None
         self._detail_editors: dict[str, Item_List_Editor | QPlainTextEdit] = {}
         self._door_rows: list[Door_Row] = []
+        # Geometry section widgets (rebuilt per room).
+        self._shape_combo: QComboBox | None = None
+        self._poly_n_spin: QSpinBox | None = None
+        self._poly_n_label: QLabel | None = None
+        self._dn_spin: QSpinBox | None = None
+        self._ds_spin: QSpinBox | None = None
+        self._dw_spin: QSpinBox | None = None
+        self._de_spin: QSpinBox | None = None
 
     # -- public ------------------------------------------------------------
 
-    def set_room(self, room: dict) -> None:
+    def set_room(self, room: dict, dungeon: dict | None = None) -> None:
         self._room = room
+        if dungeon is not None:
+            self._dungeon = dungeon
         self._build_form()
 
     # -- form construction -------------------------------------------------
@@ -735,6 +761,77 @@ class Room_Editor(QWidget):
         )
         info.setStyleSheet("color: #666;")
         layout.addWidget(info)
+        layout.addWidget(_hr())
+
+        # Geometry section — shape conversion and perimeter deltas. Applied
+        # via `dungeon_ops.reshape_room` / `resize_room` when the user clicks
+        # Apply Changes. Polygon / circle options are always present in the
+        # combo so the user can target polymorph as the goal; if the *current*
+        # bbox isn't square the op will reject the change with a clear error
+        # (driving them to first equalise the bbox via the perimeter deltas).
+        layout.addWidget(_section_label("Geometry"))
+
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(QLabel("Shape:"))
+        self._shape_combo = QComboBox()
+        # currentData is the value passed to dungeon_ops.reshape_room.
+        # "rectangle" is the user-facing label for donjon's "square" shape.
+        self._shape_combo.addItem("Rectangle", "rectangle")
+        self._shape_combo.addItem("Polygon", "polygon")
+        self._shape_combo.addItem("Circle", "circle")
+        current_stored = room.get("shape", "square")
+        ui_shape = (
+            "polygon" if current_stored == "polygon"
+            else "circle" if current_stored == "circle"
+            else "rectangle"
+        )
+        idx = self._shape_combo.findData(ui_shape)
+        if idx >= 0:
+            self._shape_combo.setCurrentIndex(idx)
+        self._shape_combo.currentIndexChanged.connect(
+            self._on_shape_combo_changed
+        )
+        shape_row.addWidget(self._shape_combo)
+
+        self._poly_n_label = QLabel("Sides N:")
+        self._poly_n_spin = QSpinBox()
+        self._poly_n_spin.setRange(3, 12)
+        self._poly_n_spin.setValue(int(room.get("polygon") or 6))
+        shape_row.addWidget(self._poly_n_label)
+        shape_row.addWidget(self._poly_n_spin)
+        shape_row.addStretch(1)
+        layout.addLayout(shape_row)
+        self._on_shape_combo_changed()  # set N visibility
+
+        # Perimeter Δ — signed spinboxes per edge. Pulls outward when positive,
+        # inward when negative. Donjon's shape="square" rooms tolerate any
+        # bbox; polymorph rooms must remain square (op rejects otherwise).
+        deltas_label = QLabel(
+            "Perimeter Δ cells (+ grows outward, − shrinks):"
+        )
+        deltas_label.setStyleSheet("color: #555;")
+        layout.addWidget(deltas_label)
+
+        deltas_row = QHBoxLayout()
+        def _delta_spin() -> QSpinBox:
+            s = QSpinBox()
+            s.setRange(-64, 64)
+            s.setValue(0)
+            s.setFixedWidth(64)
+            return s
+        self._dn_spin = _delta_spin()
+        self._ds_spin = _delta_spin()
+        self._dw_spin = _delta_spin()
+        self._de_spin = _delta_spin()
+        for label, spin in (
+            ("N", self._dn_spin), ("S", self._ds_spin),
+            ("W", self._dw_spin), ("E", self._de_spin),
+        ):
+            deltas_row.addWidget(QLabel(label))
+            deltas_row.addWidget(spin)
+            deltas_row.addSpacing(8)
+        deltas_row.addStretch(1)
+        layout.addLayout(deltas_row)
         layout.addWidget(_hr())
 
         contents = room.setdefault("contents", {})
@@ -898,11 +995,227 @@ class Room_Editor(QWidget):
                 changed_doors.append(row.door)
         return changed_doors
 
+    def _on_shape_combo_changed(self) -> None:
+        """Polygon-N spinbox is only meaningful when the chosen shape is
+        polygon."""
+        if self._shape_combo is None:
+            return
+        is_polygon = self._shape_combo.currentData() == "polygon"
+        if self._poly_n_label is not None:
+            self._poly_n_label.setVisible(is_polygon)
+        if self._poly_n_spin is not None:
+            self._poly_n_spin.setVisible(is_polygon)
+
+    def _apply_geometry(self) -> bool:
+        """Apply shape + perimeter-delta changes via dungeon_ops. Shows a
+        QMessageBox on validation failure (overlap / off-canvas / non-square
+        polymorph) and leaves the room dict untouched in that case. Returns
+        True if anything actually changed (so the caller knows to re-render).
+        """
+        if self._room is None or self._dungeon is None:
+            return False
+        if self._shape_combo is None:
+            return False
+
+        changed = False
+
+        # Resize first — reshape's square-bbox validation should run against
+        # the post-resize bbox, not the pre-resize one (otherwise the user
+        # can't grow a non-square room and turn it into a circle in a single
+        # Apply).
+        dn = self._dn_spin.value() if self._dn_spin else 0
+        ds = self._ds_spin.value() if self._ds_spin else 0
+        dw = self._dw_spin.value() if self._dw_spin else 0
+        de = self._de_spin.value() if self._de_spin else 0
+        if (dn, ds, de, dw) != (0, 0, 0, 0):
+            try:
+                if dungeon_ops.resize_room(
+                    self._dungeon, self._room, dn, ds, de, dw
+                ):
+                    changed = True
+            except ValueError as e:
+                QMessageBox.warning(self, "Cannot resize room", str(e))
+                return changed
+
+        target_shape = self._shape_combo.currentData() or "rectangle"
+        polygon_n = self._poly_n_spin.value() if self._poly_n_spin else 0
+        try:
+            if dungeon_ops.reshape_room(
+                self._room, target_shape, polygon_n=polygon_n
+            ):
+                changed = True
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot change shape", str(e))
+            return changed
+
+        return changed
+
     def _on_apply(self) -> None:
         if self._room is None:
             return
         changed_doors = self._collect_edits()
-        self.apply_clicked.emit(self._room, changed_doors)
+        geometry_changed = self._apply_geometry()
+        self.apply_clicked.emit(self._room, changed_doors, geometry_changed)
+
+    def _on_delete(self) -> None:
+        if self._room is None:
+            return
+        self.delete_clicked.emit(self._room)
+
+
+# ---------------------------------------------------------------------------
+# Mirror dialog (Phase 5)
+# ---------------------------------------------------------------------------
+
+class Mirror_Dialog(QDialog):
+    """Mirror rooms across an axis. Overwrite mode (destination-side rooms
+    overlapping the mirrored region are deleted first). Corridors and stairs
+    are NOT mirrored.
+
+    The user picks: axis (horizontal/vertical), source side (which side of
+    the pivot to copy FROM), and pivot index. Side options reset whenever
+    the axis changes — vertical axis takes west/east, horizontal takes
+    north/south."""
+
+    def __init__(self, parent, n_rows: int, n_cols: int):
+        super().__init__(parent)
+        self.setWindowTitle("Mirror Rooms")
+        self._n_rows = n_rows
+        self._n_cols = n_cols
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Overwrite mode: rooms on the destination side that overlap any\n"
+            "mirrored bbox are deleted first. Corridors and stairs are NOT\n"
+            "mirrored. Rooms straddling the pivot line are skipped."
+        )
+        intro.setStyleSheet("color: #555;")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+
+        self._axis_combo = QComboBox()
+        self._axis_combo.addItem("Horizontal (mirror across rows)", "horizontal")
+        self._axis_combo.addItem("Vertical (mirror across cols)", "vertical")
+        self._axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        form.addRow("Axis:", self._axis_combo)
+
+        self._side_combo = QComboBox()
+        form.addRow("Source side:", self._side_combo)
+
+        self._pivot_spin = QSpinBox()
+        form.addRow("Pivot index:", self._pivot_spin)
+
+        self._pivot_hint = QLabel("")
+        self._pivot_hint.setStyleSheet("color: #888;")
+        form.addRow("", self._pivot_hint)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._on_axis_changed()
+
+    def _on_axis_changed(self) -> None:
+        axis = self._axis_combo.currentData()
+        self._side_combo.clear()
+        if axis == "horizontal":
+            self._side_combo.addItem("North side (copy to South)", "north")
+            self._side_combo.addItem("South side (copy to North)", "south")
+            self._pivot_spin.setRange(0, self._n_rows - 1)
+            self._pivot_spin.setValue(self._n_rows // 2)
+            self._pivot_hint.setText(f"Row index — canvas has {self._n_rows} rows")
+        else:
+            self._side_combo.addItem("West side (copy to East)", "west")
+            self._side_combo.addItem("East side (copy to West)", "east")
+            self._pivot_spin.setRange(0, self._n_cols - 1)
+            self._pivot_spin.setValue(self._n_cols // 2)
+            self._pivot_hint.setText(f"Col index — canvas has {self._n_cols} cols")
+
+    def result_settings(self) -> tuple[str, int, str]:
+        return (
+            self._axis_combo.currentData(),
+            self._pivot_spin.value(),
+            self._side_combo.currentData(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# New-room dialog (Phase 3)
+# ---------------------------------------------------------------------------
+
+class New_Room_Dialog(QDialog):
+    """Modal shown after the user drags a room rectangle. Asks for shape +
+    polygon-N. Polygon / circle options are only enabled when the bbox is
+    square (donjon's polymorph renderer inscribes the shape in
+    `min(width, height)`).
+
+    `result_shape()` returns `(shape_name, polygon_n)` where `shape_name`
+    is one of "rectangle" / "square" / "polygon" / "circle"."""
+
+    def __init__(self, parent, cells_wide: int, cells_tall: int):
+        super().__init__(parent)
+        self.setWindowTitle("New Room")
+        self._is_square = cells_wide == cells_tall
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"Bbox: {cells_wide} × {cells_tall} cells"
+            f" ({'square' if self._is_square else 'non-square'})"
+        )
+        info.setStyleSheet("color: #666;")
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("Shape:"))
+        self._shape_combo = QComboBox()
+        # Always present "Rectangle" — donjon stores any axis-aligned rect
+        # as shape="square", but the user-facing label uses the geometric
+        # term so non-square bounds don't read as a contradiction.
+        self._shape_combo.addItem("Rectangle", "rectangle")
+        if self._is_square:
+            self._shape_combo.addItem("Polygon (N-sided)", "polygon")
+            self._shape_combo.addItem("Circle", "circle")
+        else:
+            note = QLabel(
+                "(polygon / circle require a square bbox — "
+                "drag a 1:1 rectangle to unlock them)"
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #888; font-style: italic;")
+            layout.addWidget(note)
+        self._shape_combo.currentIndexChanged.connect(self._update_n_visibility)
+        layout.addWidget(self._shape_combo)
+
+        n_row = QHBoxLayout()
+        self._n_label = QLabel("Sides (N):")
+        self._n_spin = QSpinBox()
+        self._n_spin.setRange(3, 12)
+        self._n_spin.setValue(6)
+        n_row.addWidget(self._n_label)
+        n_row.addWidget(self._n_spin)
+        n_row.addStretch(1)
+        layout.addLayout(n_row)
+        self._update_n_visibility()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_n_visibility(self) -> None:
+        is_polygon = self._shape_combo.currentData() == "polygon"
+        self._n_label.setVisible(is_polygon)
+        self._n_spin.setVisible(is_polygon)
+
+    def result_shape(self) -> tuple[str, int]:
+        shape = self._shape_combo.currentData() or "rectangle"
+        n = self._n_spin.value() if shape == "polygon" else 0
+        return shape, n
 
 
 # ---------------------------------------------------------------------------
@@ -1037,6 +1350,7 @@ class Donjon_Viewer(QMainWindow):
         # Page 1: structured room editor
         self._room_editor = Room_Editor()
         self._room_editor.apply_clicked.connect(self._on_room_applied)
+        self._room_editor.delete_clicked.connect(self._on_room_delete)
         self._details_stack.addWidget(self._room_editor)
 
         splitter.addWidget(self._details_stack)
@@ -1131,7 +1445,7 @@ class Donjon_Viewer(QMainWindow):
             rid = C.room_id(cell)
             room = self._find_room(rid)
             if room is not None:
-                self._room_editor.set_room(room)
+                self._room_editor.set_room(room, self._dungeon)
                 self._details_stack.setCurrentIndex(1)
                 return
             self._show_simple(f"Room {rid}", f"(no metadata for room {rid})")
@@ -1196,19 +1510,53 @@ class Donjon_Viewer(QMainWindow):
     # Apply (room editor wrote back)
     # ------------------------------------------------------------------
 
-    def _on_room_applied(self, room: dict, changed_doors: list):
+    def _on_room_applied(self, room: dict, changed_doors: list, geometry_changed: bool):
         if changed_doors:
             self._update_door_cell_bits(changed_doors)
+        if changed_doors or geometry_changed:
+            # Geometry changes can also reshape the cells array (via resize_room
+            # painting new cells); re-render and reload the editor so the
+            # bounds line at the top reflects the new bbox.
             self._render_to_view()
+            self._room_editor.set_room(room, self._dungeon)
+            bits = []
+            if changed_doors:
+                bits.append(f"{len(changed_doors)} door type(s)")
+            if geometry_changed:
+                bits.append("geometry")
             self.statusBar().showMessage(
-                f"Applied changes to room {room.get('id')}; "
-                f"{len(changed_doors)} door type(s) updated, map re-rendered.",
+                f"Applied changes to room {room.get('id')} ({', '.join(bits)}); "
+                "map re-rendered.",
                 5000,
             )
         else:
             self.statusBar().showMessage(
                 f"Applied changes to room {room.get('id')}.", 3000
             )
+
+    def _on_room_delete(self, room: dict) -> None:
+        rid = room.get("id", "?")
+        choice = QMessageBox.warning(
+            self,
+            "Delete room",
+            f"Delete room {rid}? This clears its cells and removes the room "
+            "metadata. Doors and contents are lost permanently.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+        if not dungeon_ops.delete_room(self._dungeon, int(rid)):
+            self.statusBar().showMessage(f"Room {rid} not found.", 4000)
+            return
+        self._render_to_view()
+        # Return the details panel to the simple-view page since the room
+        # the editor was pointed at no longer exists.
+        self._show_simple(
+            f"Room {rid} deleted",
+            "Click another cell on the map for details.",
+        )
+        self.statusBar().showMessage(f"Deleted room {rid}.", 5000)
 
     def _update_door_cell_bits(self, changed_doors: list):
         cells_arr = self._dungeon["cells"]
@@ -1256,15 +1604,64 @@ class Donjon_Viewer(QMainWindow):
         self.statusBar().showMessage(f"Stroke applied ({tool}).", 2000)
 
     def _on_rect_drawn(self, north: int, south: int, west: int, east: int) -> None:
-        """Room-rect tool released. Phase 3 will turn this into an actual
-        room-creation flow; for now it just reports the bounds."""
+        """Room-rect tool released. Clamp bounds to the canvas, refuse if any
+        bbox cell already lives in a room, then prompt for shape and create."""
         if self._dungeon is None:
             return
-        self.statusBar().showMessage(
-            f"(room create not implemented yet) bounds: rows {north}-{south}, "
-            f"cols {west}-{east}",
-            4000,
+
+        settings = self._dungeon["settings"]
+        n_rows = settings["n_rows"]
+        n_cols = settings["n_cols"]
+
+        # Clamp to canvas — drag may finish outside the map.
+        north = max(0, min(north, n_rows - 1))
+        south = max(0, min(south, n_rows - 1))
+        west = max(0, min(west, n_cols - 1))
+        east = max(0, min(east, n_cols - 1))
+        if south < north or east < west:
+            return
+
+        # Pre-flight the overlap check so we don't bother the user with a
+        # dialog they'd immediately have to cancel.
+        existing = dungeon_ops._bbox_room_id(self._dungeon, north, south, west, east)
+        if existing is not None:
+            self.statusBar().showMessage(
+                f"Bbox overlaps room id {existing} — erase or shrink it first.",
+                4000,
+            )
+            return
+
+        cells_wide = east - west + 1
+        cells_tall = south - north + 1
+
+        dialog = New_Room_Dialog(self, cells_wide, cells_tall)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        shape, polygon_n = dialog.result_shape()
+        try:
+            room = dungeon_ops.create_room(
+                self._dungeon,
+                north, south, west, east,
+                shape=shape, polygon_n=polygon_n,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot create room", str(e))
+            return
+
+        self._after_dungeon_mutated()
+        descr = (
+            f"polygon-{polygon_n}" if shape == "polygon" else shape
         )
+        self.statusBar().showMessage(
+            f"Created room {room['id']} ({descr}) at "
+            f"rows {north}-{south}, cols {west}-{east}.",
+            5000,
+        )
+        # Open the new room in the editor so the user can name it / add doors.
+        self._room_editor.set_room(room, self._dungeon)
+        self._details_stack.setCurrentIndex(1)
+        self._map_view.highlight_cell(north, west)
 
     def _after_dungeon_mutated(self) -> None:
         """Re-sync derived state after a structural op (resize, mirror, …)
@@ -1377,12 +1774,52 @@ class Donjon_Viewer(QMainWindow):
         self.statusBar().showMessage(msg, 6000)
 
     def _on_mirror_rooms(self) -> None:
-        """Phase 5 stub — mirror dialog & op not implemented yet."""
-        QMessageBox.information(
+        """Open the mirror dialog, then call `dungeon_ops.mirror_rooms` in
+        overwrite mode. Destination-side rooms overlapping any mirrored bbox
+        are deleted; corridors / stairs are NOT mirrored."""
+        if self._dungeon is None:
+            return
+        settings = self._dungeon["settings"]
+        n_rows = settings["n_rows"]
+        n_cols = settings["n_cols"]
+
+        dialog = Mirror_Dialog(self, n_rows, n_cols)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        axis, pivot, source_side = dialog.result_settings()
+
+        # The user-visible damage (deletions) is potentially large, so
+        # confirm once before mutating. We can't easily pre-flight the
+        # exact delete count without duplicating the op's logic, so the
+        # warning is generic.
+        choice = QMessageBox.warning(
             self,
-            "Mirror Rooms",
-            "Mirror is coming in the next phase of the editor expansion.",
+            "Confirm mirror",
+            f"Mirror {source_side} side across {axis} pivot {pivot} in overwrite mode.\n\n"
+            "Any rooms on the destination side that overlap a mirrored bbox\n"
+            "will be deleted permanently. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
+        if choice != QMessageBox.Yes:
+            return
+
+        try:
+            report = dungeon_ops.mirror_rooms(
+                self._dungeon, axis, pivot, source_side
+            )
+        except ValueError as e:
+            QMessageBox.critical(self, "Mirror failed", str(e))
+            return
+
+        self._after_dungeon_mutated()
+        msg = (
+            f"Mirror complete: created {len(report['created_room_ids'])} room(s), "
+            f"deleted {len(report['deleted_room_ids'])}"
+        )
+        if report["skipped_off_canvas"]:
+            msg += f", skipped {len(report['skipped_off_canvas'])} off-canvas"
+        self.statusBar().showMessage(msg + ".", 6000)
 
     # ------------------------------------------------------------------
     # Save outputs

@@ -131,6 +131,436 @@ def erase_cell(d: dict, row: int, col: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Room lifecycle
+# ---------------------------------------------------------------------------
+
+# Donjon stores widths/heights in "donjon units" — 10 per cell — and area in
+# the same units squared. Match that convention so the rooms list stays
+# byte-comparable to a freshly-generated dungeon.
+_DONJON_CELL_UNITS = 10
+
+
+def _bbox_room_id(d: dict, north: int, south: int, west: int, east: int) -> int | None:
+    """If any cell in the inclusive bbox already has a ROOM bit, return that
+    room's id (first one found). Otherwise None."""
+    for r in range(north, south + 1):
+        for c in range(west, east + 1):
+            cell = get_cell(d, r, c)
+            if C.is_room(cell):
+                return C.room_id(cell)
+    return None
+
+
+def create_room(d: dict, north: int, south: int, west: int, east: int,
+                *, shape: str = "square", polygon_n: int = 0) -> dict:
+    """Add a new room covering the inclusive bbox. Returns the room dict.
+
+    The renderer keys off cell bits for filled rectangles and off the
+    `shape` + `polygon` fields of the room dict for polymorph rendering;
+    we set both consistently.
+
+    Validation:
+      * bounds must lie inside the canvas;
+      * no cell in the bbox may already have the ROOM bit (raises
+        ValueError — the GUI catches this and surfaces it as a status
+        message);
+      * polygon / circle require a square bbox (renderer inscribes the
+        shape in min(width, height) which assumes square);
+      * polygon requires `polygon_n >= 3`.
+
+    Shape normalization: donjon uses `shape: "square"` for *any* axis-aligned
+    rectangle (square or not). We follow that convention so saved JSON
+    matches a freshly-generated dungeon — a caller passing `shape="rectangle"`
+    gets `"square"` written to the dict.
+    """
+    settings = d["settings"]
+    n_rows = settings["n_rows"]
+    n_cols = settings["n_cols"]
+
+    if not (0 <= north <= south < n_rows and 0 <= west <= east < n_cols):
+        raise ValueError(
+            f"Room bounds out of canvas (rows {north}-{south}, "
+            f"cols {west}-{east}, canvas is {n_rows}×{n_cols})."
+        )
+
+    existing_id = _bbox_room_id(d, north, south, west, east)
+    if existing_id is not None:
+        raise ValueError(
+            f"Bbox overlaps existing room id {existing_id}; "
+            "erase or shrink it first."
+        )
+
+    cells_wide = east - west + 1
+    cells_tall = south - north + 1
+    if shape in ("polygon", "circle") and cells_wide != cells_tall:
+        raise ValueError(
+            f"Polymorph rooms (polygon/circle) require a square bbox; "
+            f"got {cells_wide}×{cells_tall}."
+        )
+    if shape == "polygon" and polygon_n < 3:
+        raise ValueError(
+            f"Polygon rooms need at least 3 sides; got {polygon_n}."
+        )
+
+    stored_shape = "square" if shape == "rectangle" else shape
+
+    rooms = d.setdefault("rooms", [])
+    used_ids = [int(r["id"]) for r in rooms if r is not None]
+    next_id = max(
+        int(settings.get("last_room_id", 0)),
+        max(used_ids) if used_ids else 0,
+    ) + 1
+
+    while len(rooms) <= next_id:
+        rooms.append(None)
+
+    room: dict = {
+        "id": str(next_id),
+        "north": north,
+        "south": south,
+        "west": west,
+        "east": east,
+        "row": north,
+        "col": west,
+        "width": cells_wide * _DONJON_CELL_UNITS,
+        "height": cells_tall * _DONJON_CELL_UNITS,
+        "area": cells_wide * cells_tall * (_DONJON_CELL_UNITS ** 2),
+        "shape": stored_shape,
+        "size": "",
+        "doors": {},
+        "contents": {},
+    }
+    if stored_shape == "polygon":
+        room["polygon"] = polygon_n
+
+    rooms[next_id] = room
+
+    room_id_bits = next_id << 6
+    for r in range(north, south + 1):
+        for c in range(west, east + 1):
+            set_cell(d, r, c, C.ROOM | room_id_bits)
+
+    settings["last_room_id"] = next_id
+    settings["n_rooms"] = sum(1 for x in rooms if x is not None)
+
+    return room
+
+
+def reshape_room(room: dict, new_shape: str, polygon_n: int = 0) -> bool:
+    """Switch an existing room's shape (rectangle / polygon / circle).
+
+    Doesn't touch cells — every cell in the bbox keeps `ROOM | room_id` either
+    way; the renderer decides polygon / circle / fill from the room dict's
+    `shape` (and `polygon`) fields. Validates that polymorph shapes require
+    a square bbox and that polygon needs N ≥ 3. Returns True if the room
+    dict actually changed."""
+    cells_wide = room["east"] - room["west"] + 1
+    cells_tall = room["south"] - room["north"] + 1
+    stored_shape = "square" if new_shape == "rectangle" else new_shape
+
+    if stored_shape in ("polygon", "circle") and cells_wide != cells_tall:
+        raise ValueError(
+            f"Polymorph rooms require a square bbox; "
+            f"current bbox is {cells_wide}×{cells_tall} — resize first."
+        )
+    if stored_shape == "polygon" and polygon_n < 3:
+        raise ValueError(
+            f"Polygon rooms need at least 3 sides; got {polygon_n}."
+        )
+
+    old_shape = room.get("shape")
+    old_polygon = room.get("polygon")
+    new_polygon = polygon_n if stored_shape == "polygon" else None
+
+    if old_shape == stored_shape and old_polygon == new_polygon:
+        return False
+
+    room["shape"] = stored_shape
+    if stored_shape == "polygon":
+        room["polygon"] = polygon_n
+    else:
+        room.pop("polygon", None)
+    return True
+
+
+def resize_room(d: dict, room: dict, dn: int, ds: int, de: int, dw: int) -> bool:
+    """Grow / shrink a room's bbox by the per-edge cell deltas.
+
+    Positive deltas extend that edge outward; negative deltas pull it
+    inward. Validates that the new bbox stays in the canvas, has area ≥ 1,
+    doesn't overlap any other room, and (for polymorph rooms) stays square.
+
+    On success: cells outside the new bbox that belonged to this room are
+    cleared; cells now inside the bbox get `ROOM | room_id` (overwriting
+    whatever was there — corridor / door / block / label). Room metadata
+    (north/south/east/west/row/col/width/height/area) is updated to match.
+    Doors that fall outside the new bbox are NOT auto-relocated — the caller
+    can edit the doors section to clean up.
+    """
+    if (dn, ds, de, dw) == (0, 0, 0, 0):
+        return False
+
+    settings = d["settings"]
+    n_rows = settings["n_rows"]
+    n_cols = settings["n_cols"]
+    rid = int(room["id"])
+    rid_bits = rid << 6
+
+    new_north = room["north"] - dn
+    new_south = room["south"] + ds
+    new_west = room["west"] - dw
+    new_east = room["east"] + de
+
+    if not (0 <= new_north <= new_south < n_rows and 0 <= new_west <= new_east < n_cols):
+        raise ValueError(
+            f"Resize would take room {rid} out of canvas "
+            f"(rows {new_north}-{new_south}, cols {new_west}-{new_east})."
+        )
+
+    new_wide = new_east - new_west + 1
+    new_tall = new_south - new_north + 1
+    if room.get("shape") in ("polygon", "circle") and new_wide != new_tall:
+        raise ValueError(
+            f"Polymorph room must remain square; "
+            f"new bbox would be {new_wide}×{new_tall}."
+        )
+
+    # Overlap check — any other room's cell falling inside our new bbox blocks
+    # the resize. We check before mutating anything.
+    for r in range(new_north, new_south + 1):
+        for c in range(new_west, new_east + 1):
+            cell = get_cell(d, r, c)
+            if C.is_room(cell) and C.room_id(cell) != rid:
+                raise ValueError(
+                    f"Resize would overlap room id {C.room_id(cell)} "
+                    f"at ({r},{c}); shrink or delete that room first."
+                )
+
+    old_n = room["north"]
+    old_s = room["south"]
+    old_w = room["west"]
+    old_e = room["east"]
+
+    # Clear cells that were in the OLD bbox but won't be in the new one.
+    for r in range(old_n, old_s + 1):
+        for c in range(old_w, old_e + 1):
+            if new_north <= r <= new_south and new_west <= c <= new_east:
+                continue
+            cell = get_cell(d, r, c)
+            if C.is_room(cell) and C.room_id(cell) == rid:
+                set_cell(d, r, c, C.NOTHING)
+
+    # Paint cells that are in the new bbox but weren't in the old one.
+    for r in range(new_north, new_south + 1):
+        for c in range(new_west, new_east + 1):
+            if old_n <= r <= old_s and old_w <= c <= old_e:
+                continue
+            set_cell(d, r, c, C.ROOM | rid_bits)
+
+    room["north"] = new_north
+    room["south"] = new_south
+    room["west"] = new_west
+    room["east"] = new_east
+    room["row"] = new_north
+    room["col"] = new_west
+    room["width"] = new_wide * _DONJON_CELL_UNITS
+    room["height"] = new_tall * _DONJON_CELL_UNITS
+    room["area"] = new_wide * new_tall * (_DONJON_CELL_UNITS ** 2)
+    return True
+
+
+def delete_room(d: dict, room_id: int) -> bool:
+    """Remove a room and clear its cells. Returns True if a room was removed.
+
+    Drops the room dict from `rooms` (replaced with None to preserve the
+    1-indexed convention), clears every cell inside the bbox that carries
+    this room's id, and strips the door-type bits from each of the room's
+    own door cells (CORRIDOR / label bits on those cells are kept — a door
+    cell in donjon's encoding is a corridor floor with a door overlay, so
+    removing only the door bits leaves a usable corridor in place)."""
+    rooms = d.get("rooms") or []
+    target = None
+    target_idx = None
+    for i, r in enumerate(rooms):
+        if r is not None and int(r["id"]) == int(room_id):
+            target = r
+            target_idx = i
+            break
+    if target is None:
+        return False
+
+    for r in range(target["north"], target["south"] + 1):
+        for c in range(target["west"], target["east"] + 1):
+            cell = get_cell(d, r, c)
+            if C.is_room(cell) and C.room_id(cell) == int(room_id):
+                set_cell(d, r, c, C.NOTHING)
+
+    for door_list in (target.get("doors") or {}).values():
+        for door in door_list:
+            cell = get_cell(d, door["row"], door["col"])
+            set_cell(d, door["row"], door["col"], cell & ~C.DOOR_TYPES)
+
+    rooms[target_idx] = None
+    settings = d["settings"]
+    settings["n_rooms"] = sum(1 for x in rooms if x is not None)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Mirror rooms (one-shot, overwrite)
+# ---------------------------------------------------------------------------
+
+_OPPOSITE_DIRECTION = {
+    "north": "south", "south": "north",
+    "east": "west", "west": "east",
+}
+
+
+def mirror_rooms(d: dict, axis: str, pivot: int, source_side: str) -> dict:
+    """Mirror rooms across an axis. Overwrite mode: any room on the
+    destination side that overlaps a mirrored bbox is deleted first.
+
+    Args:
+        axis: ``"horizontal"`` mirrors rows around `pivot` (a row index);
+            ``"vertical"`` mirrors cols around `pivot` (a col index).
+        pivot: integer index of the mirror line. Rooms straddling the pivot
+            (i.e., on both sides) are excluded from mirroring — there's no
+            meaningful one-sided source for them.
+        source_side: which side is the source. Horizontal axis takes
+            ``"north"`` or ``"south"``; vertical axis takes ``"west"`` or
+            ``"east"``. Source rooms are those strictly on that side of the
+            pivot.
+
+    Corridors and stairs are NOT mirrored. The source rooms' cells stay in
+    place; the destination side receives mirrored copies (cells, doors,
+    contents) with new room ids.
+
+    Returns ``{"created_room_ids": [...], "deleted_room_ids": [...],
+    "skipped_off_canvas": [...]}``. `skipped_off_canvas` lists source-room
+    ids whose mirrored bbox would fall outside the canvas — those are
+    silently skipped rather than failing the whole op.
+    """
+    if axis not in ("horizontal", "vertical"):
+        raise ValueError(f"Unknown axis: {axis!r}")
+    if axis == "horizontal" and source_side not in ("north", "south"):
+        raise ValueError("Horizontal axis requires source_side north/south.")
+    if axis == "vertical" and source_side not in ("west", "east"):
+        raise ValueError("Vertical axis requires source_side west/east.")
+
+    settings = d["settings"]
+    n_rows = settings["n_rows"]
+    n_cols = settings["n_cols"]
+    if axis == "horizontal" and not (0 <= pivot < n_rows):
+        raise ValueError(f"Pivot row {pivot} out of canvas (0..{n_rows - 1}).")
+    if axis == "vertical" and not (0 <= pivot < n_cols):
+        raise ValueError(f"Pivot col {pivot} out of canvas (0..{n_cols - 1}).")
+
+    def _is_source(room: dict) -> bool:
+        if axis == "horizontal":
+            return (
+                room["south"] < pivot if source_side == "north"
+                else room["north"] > pivot
+            )
+        return (
+            room["east"] < pivot if source_side == "west"
+            else room["west"] > pivot
+        )
+
+    def _mirror_bbox(room: dict) -> tuple[int, int, int, int]:
+        if axis == "horizontal":
+            return (2 * pivot - room["south"], 2 * pivot - room["north"],
+                    room["west"], room["east"])
+        return (room["north"], room["south"],
+                2 * pivot - room["east"], 2 * pivot - room["west"])
+
+    def _mirror_rc(row: int, col: int) -> tuple[int, int]:
+        if axis == "horizontal":
+            return 2 * pivot - row, col
+        return row, 2 * pivot - col
+
+    def _mirror_direction(direction: str) -> str:
+        if axis == "horizontal" and direction in ("north", "south"):
+            return _OPPOSITE_DIRECTION[direction]
+        if axis == "vertical" and direction in ("east", "west"):
+            return _OPPOSITE_DIRECTION[direction]
+        return direction
+
+    rooms = d.get("rooms") or []
+    source_rooms = [r for r in rooms if r is not None and _is_source(r)]
+
+    # Plan: compute every mirrored bbox up front, dropping ones that would
+    # fall off the canvas. Then identify destination rooms to delete (those
+    # overlapping any mirrored bbox AND not themselves a source room we're
+    # about to copy from).
+    planned: list[tuple[dict, tuple[int, int, int, int]]] = []
+    skipped: list[str] = []
+    for src in source_rooms:
+        mn, ms, mw, me = _mirror_bbox(src)
+        if not (0 <= mn <= ms < n_rows and 0 <= mw <= me < n_cols):
+            skipped.append(src.get("id", "?"))
+            continue
+        planned.append((src, (mn, ms, mw, me)))
+
+    source_ids = {int(s["id"]) for s in source_rooms}
+    to_delete_ids: set[int] = set()
+    for _src, (mn, ms, mw, me) in planned:
+        for room in rooms:
+            if room is None:
+                continue
+            rid = int(room["id"])
+            if rid in source_ids or rid in to_delete_ids:
+                continue
+            if room["north"] > ms or room["south"] < mn:
+                continue
+            if room["west"] > me or room["east"] < mw:
+                continue
+            to_delete_ids.add(rid)
+
+    for rid in sorted(to_delete_ids):
+        delete_room(d, rid)
+
+    created_ids: list[int] = []
+    for src, (mn, ms, mw, me) in planned:
+        new_room = create_room(
+            d, mn, ms, mw, me,
+            shape=src.get("shape", "square"),
+            polygon_n=int(src.get("polygon", 0) or 0),
+        )
+        new_room["size"] = src.get("size", "")
+        # Deep-copy mutable substructures so editing one room's contents
+        # later doesn't bleed into its mirror.
+        import copy
+        new_room["contents"] = copy.deepcopy(src.get("contents") or {})
+
+        new_doors: dict[str, list[dict]] = {}
+        for direction, door_list in (src.get("doors") or {}).items():
+            mirrored_dir = _mirror_direction(direction)
+            for door in door_list:
+                mr, mc = _mirror_rc(door["row"], door["col"])
+                if not (0 <= mr < n_rows and 0 <= mc < n_cols):
+                    continue  # door would fall off canvas; skip
+                new_door = copy.deepcopy(door)
+                new_door["row"] = mr
+                new_door["col"] = mc
+                new_doors.setdefault(mirrored_dir, []).append(new_door)
+
+                # Paint the door cell — donjon door cells carry CORRIDOR
+                # plus the door-type bit (no ROOM, no PERIMETER).
+                cell = get_cell(d, mr, mc)
+                door_bit = C.door_type_bit(door.get("type", "door"))
+                cell = (cell & C.LABEL) | C.CORRIDOR | door_bit
+                set_cell(d, mr, mc, cell)
+        new_room["doors"] = new_doors
+        created_ids.append(int(new_room["id"]))
+
+    return {
+        "created_room_ids": created_ids,
+        "deleted_room_ids": sorted(to_delete_ids),
+        "skipped_off_canvas": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Canvas resize
 # ---------------------------------------------------------------------------
 

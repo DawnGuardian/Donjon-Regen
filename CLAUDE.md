@@ -85,8 +85,13 @@ PySide6-based viewer/editor. `QMainWindow` with a top toolbar (Open JSON / Save 
 Pure mutations on the in-memory dungeon dict. Each op keeps invariants consistent (`cells` ↔ `rooms` metadata, `settings.n_rows/n_cols`, padding) so the next render is correct. After any structural op the `cells` 2D array is normalised so `len(cells) == n_rows`, `len(cells[0]) == n_cols` (i.e., the cells-array padding offset becomes 0). The main window's `_after_dungeon_mutated()` recomputes its cached `_row_off / _col_off` and re-renders.
 
 - **`paint_corridor(d, row, col)`** — set `CORRIDOR` bit, preserve any existing label char. Refuses to overwrite a room cell.
-- **`erase_cell(d, row, col)`** — reset to `NOTHING`. Does NOT update room metadata: erasing room-interior cells leaves the room bbox in the dict inconsistent with the rendered fill — use the (forthcoming) `delete_room` op for full removal.
+- **`erase_cell(d, row, col)`** — reset to `NOTHING`. Does NOT update room metadata: erasing room-interior cells leaves the room bbox in the dict inconsistent with the rendered fill — use `delete_room` for full removal.
+- **`create_room(d, north, south, west, east, *, shape="square", polygon_n=0)`** — add a new room covering the inclusive bbox. Validates: bounds inside canvas, no cell in bbox already has a `ROOM` bit (raises `ValueError`), polygon/circle require a square bbox, polygon needs `polygon_n ≥ 3`. Shape `"rectangle"` is normalised to donjon's `"square"`. Allocates a new id (max of `last_room_id` and any used id, +1), grows the 1-indexed rooms list, paints cells with `ROOM | (id << 6)`, updates `settings.last_room_id` and `n_rooms`.
+- **`delete_room(d, room_id)`** — drop the room from `rooms` (replaced with None), clear cells with this room's id, strip door-type bits from this room's door cells (CORRIDOR / label bits on those cells are kept — a door cell is corridor floor with a door overlay). Updates `n_rooms`.
+- **`reshape_room(room, new_shape, polygon_n=0)`** — switch shape between rectangle / polygon / circle. Doesn't touch cells (the renderer keys polymorph rendering off the room dict). Validates polymorph requires square bbox and polygon needs N ≥ 3.
+- **`resize_room(d, room, dn, ds, de, dw)`** — grow / shrink a room's bbox by per-edge deltas. Validates against canvas bounds, overlap with other rooms, and (for polymorph rooms) post-resize squareness. Clears cells outside the new bbox that belonged to this room; paints new bbox cells with `ROOM | room_id`. Updates room metadata (north/south/east/west/row/col/width/height/area). Doors that fall outside the new bbox are not auto-relocated.
 - **`resize_canvas(d, n_add, s_add, e_add, w_add, *, force=False)`** — positive deltas grow that edge, negative deltas shrink. Coordinates shift so existing content stays anchored (e.g., `n_add=5` pushes every row index by +5). Pre-flights which rooms / stairs would fall outside the new bounds and raises `Canvas_Resize_Conflict` with the victim list unless `force=True`. Also shifts: room bbox / row / col, room.doors[*].row/col, stairs, corridor_features marks, egress entries. Settings (`n_rows`, `n_cols`, `max_row`, `max_col`, `n_rooms`) are updated.
+- **`mirror_rooms(d, axis, pivot, source_side)`** — one-shot mirror in overwrite mode. `axis` is `"horizontal"` (rows mirror across pivot row) or `"vertical"` (cols mirror across pivot col); `source_side` picks the source half (`"north"/"south"` or `"west"/"east"`). For each source room: computes the mirrored bbox, deletes any destination rooms overlapping it (overwrite), then creates a fresh room at the mirrored coords with new id, deep-copied contents, and mirrored doors (door-type bits painted on the destination cells). Corridors and stairs are NOT mirrored. Rooms straddling the pivot are skipped. Source rooms whose mirrored bbox would fall off the canvas are silently skipped and listed in the return value (`skipped_off_canvas`).
 - **Details panel** — `QStackedWidget` with two pages: page 0 = simple read-only `QLabel`+`QTextEdit` (corridors, doors, wall/wandering); page 1 = `Room_Editor`.
 - **Click resolution** — based on the cell bitmask: room → `Room_Editor` for `rooms[id]`; corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
 - **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker`) so the UI stays responsive.
@@ -95,6 +100,10 @@ Pure mutations on the in-memory dungeon dict. Each op keeps invariants consisten
 ### Room editor
 
 Structured form built from the room dict. Edits live in the in-memory dungeon and are flushed by **Apply Changes**; saving to disk is still done via Save Outputs.
+
+- **Geometry section** — at the top: Shape combo (Rectangle / Polygon / Circle), Polygon-N spinbox (visible only when shape=Polygon), and four signed perimeter Δ spinboxes (N / S / W / E). On Apply, `dungeon_ops.resize_room` runs first, then `dungeon_ops.reshape_room` — so a user can grow a non-square room to square *and* convert it to polygon/circle in one Apply. Either op surfaces validation failures (off-canvas / overlap / non-square polymorph) via `QMessageBox.warning` and leaves the room dict untouched on failure.
+- **Delete Room button** (bottom-left of the editor) — emits `delete_clicked`. The main window confirms via `QMessageBox.warning(Yes|No)` and dispatches `dungeon_ops.delete_room`; on success the details panel returns to the simple-view page.
+- The `apply_clicked` signal payload is `(room, changed_doors, geometry_changed)` — the main window re-renders the map and re-sets the editor (to refresh the bounds header) whenever doors or geometry changed.
 
 - **Summary** — `QLineEdit`.
 - **Inhabited** — read-only line, derived from the monster list (items before the first `'--'`, with the ` (cr …)` suffix stripped, comma-joined). Auto-refreshes when monster items change. Hidden when there are no monsters.
@@ -202,4 +211,4 @@ itself.
 
 ## TODO
 
-- **Write `README.md`** — currently empty (0 bytes). Should cover what the tool does, install (`uv sync`), CLI + GUI usage (including `-s/--scale` and the GUI scale spinbox), and a screenshot of the GM map.
+_(empty)_
