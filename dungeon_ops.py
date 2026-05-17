@@ -94,11 +94,92 @@ class Canvas_Resize_Conflict(Exception):
 # Single-cell brush ops (corridor brush, eraser)
 # ---------------------------------------------------------------------------
 
-def paint_corridor(d: dict, row: int, col: int) -> bool:
+def _room_by_id(d: dict, rid: int) -> dict | None:
+    """Return the room dict with the given id, or None if it isn't present."""
+    for r in d.get("rooms") or []:
+        if r is not None and int(r["id"]) == int(rid):
+            return r
+    return None
+
+
+# Brushed-cell → room-neighbour offsets and the room-relative wall a door at
+# the brushed cell sits on. If the room cell is the *north* neighbour of the
+# brushed cell, the brushed cell lies on that room's south wall, so the door
+# is registered under doors["south"]. Scanned in this fixed order, so the
+# first room found wins when a brushed cell borders more than one room.
+_AUTO_DOOR_NEIGHBOURS = (
+    (-1, 0, "south"),   # room above the brushed cell → room's south wall
+    (1, 0, "north"),    # room below                  → room's north wall
+    (0, -1, "east"),    # room to the left            → room's east wall
+    (0, 1, "west"),     # room to the right           → room's west wall
+)
+
+# Generic descriptions for an auto-inserted door — the user can refine these
+# in the Room editor afterwards.
+_DEFAULT_DOOR_DESC = {
+    "arch": "Archway",
+    "door": "Unlocked Door",
+    "locked": "Locked Door",
+    "trapped": "Trapped Door",
+    "secret": "Secret Door",
+    "portcullis": "Portcullis",
+}
+
+
+def _auto_door_after_corridor(d: dict, row: int, col: int,
+                              door_type: str) -> dict | None:
+    """If the freshly-painted corridor cell at (row, col) borders a room,
+    drop a door there: set the door-type bit on the cell and register the
+    door in the adjacent room's `doors[direction]` list. Returns the new
+    door dict (or the existing one if a door is already registered at this
+    cell), else None when the cell borders no room.
+
+    The first room found — scanning north, south, west, east — wins; at a
+    1-cell-thick wall a single brushed cell can sit between two rooms, but
+    one door symbol serves both sides either way."""
+    for dr, dc, direction in _AUTO_DOOR_NEIGHBOURS:
+        neighbour = get_cell(d, row + dr, col + dc)
+        if not C.is_room(neighbour):
+            continue
+        room = _room_by_id(d, C.room_id(neighbour))
+        if room is None:
+            continue
+
+        # Door cells in donjon's encoding are corridor floor with a door
+        # overlay — keep CORRIDOR (and any label char), add the door bit.
+        door_bit = C.door_type_bit(door_type) or C.DOOR
+        set_cell(d, row, col, get_cell(d, row, col) | door_bit)
+
+        wall = room.setdefault("doors", {}).setdefault(direction, [])
+        for existing in wall:
+            if existing.get("row") == row and existing.get("col") == col:
+                return existing
+        door = {
+            "row": row,
+            "col": col,
+            "type": door_type,
+            "desc": _DEFAULT_DOOR_DESC.get(door_type, door_type.capitalize()),
+        }
+        wall.append(door)
+        return door
+    return None
+
+
+def paint_corridor(d: dict, row: int, col: int, *,
+                   auto_door: bool = True, door_type: str = "door") -> bool:
     """Mark the cell at (row, col) as a corridor tile. Returns True if the
     cell was changed. Refuses to overwrite an existing room cell — corridors
     are meant to fill the space *between* rooms; if the user wants to remove
-    a room cell first they need the eraser."""
+    a room cell first they need the eraser.
+
+    Auto-door: when the brush turns a non-corridor cell into a *new* corridor
+    tile and that cell borders a room, a door is inserted at the brushed cell
+    (door-type bit on the cell + an entry in the room's `doors` list). Pass
+    `auto_door=False` to suppress this, or `door_type` to choose the symbol
+    (default `"door"`). Extending an existing corridor never triggers an
+    auto-door — a cell that is already plain corridor floor short-circuits
+    before the door check — and a cell that already carries a door bit is
+    left for the user to edit rather than re-doored."""
     settings = d["settings"]
     if not (0 <= row < settings["n_rows"] and 0 <= col < settings["n_cols"]):
         return False
@@ -107,10 +188,13 @@ def paint_corridor(d: dict, row: int, col: int) -> bool:
         return False
     if C.is_corridor(cell) and not (cell & (C.BLOCK | C.PERIMETER | C.DOOR_TYPES)):
         return False
+    had_door = bool(cell & C.DOOR_TYPES)
     # Drop bits that conflict with "plain open corridor floor".
     keep_mask = C.LABEL  # keep any pre-existing label char (corridor feature)
     new_cell = (cell & keep_mask) | C.CORRIDOR
     set_cell(d, row, col, new_cell)
+    if auto_door and not had_door:
+        _auto_door_after_corridor(d, row, col, door_type)
     return True
 
 
