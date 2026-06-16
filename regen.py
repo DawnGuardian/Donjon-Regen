@@ -44,7 +44,7 @@ def main():
     args = parser.parse_args()
 
     if args.gui:
-        from gui import main as gui_main
+        from app import main as gui_main
         gui_main()
         return
 

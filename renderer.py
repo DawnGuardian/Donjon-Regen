@@ -624,10 +624,22 @@ def _draw_stair_down(draw, sx, sy, sw, sh, wall_w, direction):
 _LABEL_FONT_CANDIDATES = (
     # Serifed monospace fonts, in preference order. Courier is the classic
     # typewriter face; Courier New is the Microsoft-licensed equivalent that
-    # ships under macOS Supplemental. The default is the last-resort fallback.
+    # ships under macOS Supplemental. Absolute paths are tried first, then
+    # bare names that let Pillow resolve from the platform font directories
+    # (covers packaged/frozen builds where the layout may differ). The PIL
+    # default bitmap font is the last-resort fallback.
+    # macOS
     "/System/Library/Fonts/Courier.ttc",
     "/System/Library/Fonts/Supplemental/Courier New.ttf",
     "/Library/Fonts/Courier New.ttf",
+    # Windows (Courier New ships with every install)
+    "C:/Windows/Fonts/cour.ttf",
+    # Linux (DejaVu Sans Mono is the near-universal monospace fallback)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    # Bare-name lookups (Pillow searches the platform font directories)
+    "cour.ttf",
+    "Courier New.ttf",
+    "DejaVuSansMono.ttf",
 )
 
 

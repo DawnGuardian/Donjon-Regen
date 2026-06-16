@@ -6,9 +6,9 @@ Recreates [donjon.bin.sh](https://donjon.bin.sh/5e/dungeon/) dungeon generator o
 
 ```
 Donjon-Regen/           # Project root — all source lives here
-  main.py               # CLI entry point
+  regen.py              # CLI entry point (also launches the GUI with --gui)
+  app.py                # PySide6 GUI (viewer-first); packaging/app entry point
   generate.py           # Shared generation logic (used by CLI and GUI)
-  gui.py                # PySide6 GUI (viewer-first)
   cells.py              # Cell bitmask constants & helper functions
   dungeon_ops.py        # Pure mutations on the dungeon dict (resize / paint / erase / etc.)
   renderer.py           # PIL-based map renderer (GM & player maps)
@@ -25,8 +25,11 @@ Donjon-Regen/           # Project root — all source lives here
     secret.png
     up.png
     down.png
+  donjon-regen.spec     # PyInstaller build spec (targets app.py)
+  .github/workflows/    # CI — build.yml freezes the macOS .app + Windows .exe
   test-data/            # Reference test files (deletable/replaceable; NOT committed)
   renders/              # Generated output files (default output directory; NOT committed)
+  build/ , dist/        # PyInstaller output (gitignored; NOT committed)
   pyproject.toml
   CLAUDE.md
 ```
@@ -37,22 +40,36 @@ The following directories must **never** be staged or committed:
 
 - `test-data/` — bulky donjon reference assets, considered local-only fixtures.
 - `renders/` — generated output of the tool itself; reproducible from any JSON.
+- `build/` and `dist/` — PyInstaller build scratch + frozen bundles; reproducible from `donjon-regen.spec`. (Already covered by `.gitignore`.)
 
-When committing, stage source files explicitly by name. Do not use `git add -A` or `git add .`. If either directory ever appears in `git status`, leave it untracked.
+When committing, stage source files explicitly by name. Do not use `git add -A` or `git add .`. If any of these directories ever appears in `git status`, leave it untracked.
 
 ## Usage
 
 ```bash
 # CLI — render to PNG/HTML/TSV/CSV
-uv run python main.py <dungeon.json>
-# e.g. uv run python main.py test-data/test.json
+uv run python regen.py <dungeon.json>
+# e.g. uv run python regen.py test-data/test.json
 # Output goes to renders/ by default, override with -o <dir>
 # Override the render scale with -s/--scale <int> (default 2)
 
 # GUI — interactive viewer (open JSON, click rooms/corridors for details)
-uv run python main.py --gui
-# (gui.py is also still directly executable: `uv run python gui.py`)
+uv run python regen.py --gui
+# (app.py is also directly executable: `uv run python app.py` — the packaging entry point)
 ```
+
+## Packaging
+
+The GUI freezes into a standalone desktop bundle via PyInstaller (a dev
+dependency). `app.py` is the bundle entry point; `donjon-regen.spec` drives the
+build (`uv run pyinstaller donjon-regen.spec --noconfirm` → `dist/`). The spec
+bundles no data files — door/stair glyphs are procedural and label fonts
+resolve from the host OS (`renderer._LABEL_FONT_CANDIDATES` now lists
+macOS/Windows/Linux paths plus bare-name lookups for frozen builds). Builds are
+per-OS (no cross-compile); `.github/workflows/build.yml` builds the macOS `.app`
+and Windows `.exe` on hosted runners and publishes them to a GitHub Release on
+`v*` tags. Bundles are unsigned (Gatekeeper/SmartScreen warnings until
+signed/notarized).
 
 The GUI is the primary workflow; the CLI remains available for headless
 rendering and scripted batch jobs.
@@ -64,7 +81,7 @@ rendering and scripted batch jobs.
 - NumPy >= 2.4 (used for pixel-diff analysis when comparing renders against reference images)
 - PySide6 >= 6.8 (GUI; LGPL Qt bindings — installed as a normal PyPI dep)
 
-## GUI (gui.py)
+## GUI (app.py)
 
 PySide6-based viewer/editor. `QMainWindow` with a top toolbar (Open JSON / Save Outputs / tool selector / structural-edit actions / Fit / Scale spinbox), a horizontal `QSplitter` containing a `Map_View` (left) and a `QStackedWidget` details panel (right), and a status bar.
 

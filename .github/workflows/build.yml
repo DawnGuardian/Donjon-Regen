@@ -1,0 +1,84 @@
+name: Build desktop apps
+
+# Builds the Donjon Regen GUI into a macOS .app and a Windows .exe bundle.
+#
+# Each target MUST be built on its own OS — PyInstaller cannot cross-compile —
+# so the build job fans out across macOS and Windows runners. Artifacts are
+# uploaded on every run; pushing a version tag (v*) also publishes them to a
+# GitHub Release.
+#
+# The bundles are UNSIGNED. End users will hit Gatekeeper (macOS) / SmartScreen
+# (Windows) warnings until you add code-signing + notarization — see README
+# "Packaging & distribution".
+
+on:
+  workflow_dispatch:        # manual "Run workflow" button
+  push:
+    tags:
+      - "v*"                # e.g. v1.0.0 → builds + cuts a release
+
+permissions:
+  contents: write           # needed for the release job to upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: Donjon-Regen-macos
+          - os: windows-latest
+            artifact: Donjon-Regen-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # uv reads requires-python (>=3.14) from pyproject and fetches a matching
+      # interpreter automatically. --dev pulls in PyInstaller.
+      - name: Sync dependencies
+        run: uv sync --dev
+
+      - name: Build bundle
+        run: uv run pyinstaller donjon-regen.spec --noconfirm
+
+      # Zip the bundle so the artifact preserves the .app bundle structure /
+      # the one-dir layout. ditto keeps macOS resource forks + symlinks intact.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Donjon Regen.app" "${{ matrix.artifact }}.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "dist/Donjon Regen" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
