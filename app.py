@@ -72,7 +72,7 @@ from PySide6.QtWidgets import (
 
 import cells as C
 import dungeon_ops
-from generate import generate_dungeon
+from generate import generate_dungeon, existing_outputs
 from renderer import render_map, RENDER_SCALE
 
 
@@ -341,16 +341,22 @@ class Save_Worker(QThread):
     finished_ok = Signal(int, str)
     failed = Signal(str)
 
-    def __init__(self, dungeon: dict, out_dir: str, render_scale: int, parent=None):
+    def __init__(
+        self, dungeon: dict, out_dir: str, render_scale: int, force: bool, parent=None
+    ):
         super().__init__(parent)
         self._dungeon = dungeon
         self._out_dir = out_dir
         self._render_scale = render_scale
+        self._force = force
 
     def run(self):
         try:
             generated = generate_dungeon(
-                self._dungeon, self._out_dir, render_scale=self._render_scale
+                self._dungeon,
+                self._out_dir,
+                render_scale=self._render_scale,
+                force=self._force,
             )
             self.finished_ok.emit(len(generated), self._out_dir)
         except Exception as e:
@@ -1835,10 +1841,29 @@ class Donjon_Viewer(QMainWindow):
         if not out_dir:
             return
 
+        # Warn before clobbering anything already in the chosen directory —
+        # including the source export, when the user saves back over it.
+        clashes = existing_outputs(self._dungeon, out_dir)
+        if clashes:
+            listed = "\n".join(f"  • {p.name}" for p in clashes)
+            answer = QMessageBox.warning(
+                self,
+                "Overwrite existing files?",
+                f"{len(clashes)} file(s) in this directory will be overwritten:\n\n"
+                f"{listed}\n\nOverwrite them?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.statusBar().showMessage("Save cancelled.", 4000)
+                return
+
         self._save_action.setEnabled(False)
         self._save_action.setText("Saving…")
 
-        worker = Save_Worker(self._dungeon, out_dir, self._scale_spin.value(), self)
+        worker = Save_Worker(
+            self._dungeon, out_dir, self._scale_spin.value(), True, self
+        )
         worker.finished_ok.connect(self._on_save_finished)
         worker.failed.connect(self._on_save_failed)
         worker.finished.connect(self._on_save_done)

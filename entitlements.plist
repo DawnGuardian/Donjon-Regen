@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened-runtime entitlements for the notarized macOS bundle.
+
+  Apple's notarization service requires the Hardened Runtime
+  (`codesign --options runtime`). A PyInstaller + CPython + Qt app trips
+  several of its default restrictions, so we opt back out of exactly the ones
+  a frozen Python app needs:
+
+    * allow-jit / allow-unsigned-executable-memory — CPython and Qt's V8-less
+      JS engine map writable+executable memory; without these the app is
+      killed on launch under the hardened runtime.
+    * disable-library-validation — PyInstaller bundles many third-party dylibs
+      and Qt plugins that are NOT signed by our Team ID; library validation
+      would refuse to load them.
+    * allow-dyld-environment-variables — the PyInstaller bootloader sets
+      DYLD_* variables to locate the bundled interpreter and libraries.
+
+  These are the standard, minimal set for a frozen Python/Qt GUI. They do not
+  request any privacy-sensitive capabilities (camera, mic, etc.).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+</dict>
+</plist>

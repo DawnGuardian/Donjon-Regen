@@ -7,9 +7,23 @@ name: Build desktop apps
 # uploaded on every run; pushing a version tag (v*) also publishes them to a
 # GitHub Release.
 #
-# The bundles are UNSIGNED. End users will hit Gatekeeper (macOS) / SmartScreen
-# (Windows) warnings until you add code-signing + notarization — see README
-# "Packaging & distribution".
+# Code signing is CONDITIONAL on repository secrets (see below). When the
+# secrets are present the bundles are fully signed — Developer-ID-signed +
+# notarized + stapled on macOS, Authenticode-signed on Windows — and clear
+# Gatekeeper / SmartScreen cleanly. When the secrets are absent the pipeline
+# still succeeds and produces UNSIGNED bundles (macOS gets an ad-hoc signature
+# so Apple Silicon can launch it at all); users then hit the OS warnings
+# documented in README "Packaging & distribution".
+#
+# Secrets that enable signing (Settings → Secrets and variables → Actions):
+#   macOS   — MACOS_CERT_P12_BASE64   base64 of the Developer ID Application .p12
+#             MACOS_CERT_PASSWORD     password for that .p12
+#             MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Name (TEAMID)"
+#             MACOS_NOTARY_APPLE_ID   Apple ID email for notarytool
+#             MACOS_NOTARY_PASSWORD   app-specific password for that Apple ID
+#             MACOS_NOTARY_TEAM_ID    10-char Apple Developer Team ID
+#   Windows — WINDOWS_CERT_PFX_BASE64 base64 of an Authenticode code-signing .pfx
+#             WINDOWS_CERT_PASSWORD   password for that .pfx
 
 on:
   workflow_dispatch:        # manual "Run workflow" button
@@ -48,21 +62,115 @@ jobs:
       - name: Build bundle
         run: uv run pyinstaller donjon-regen.spec --noconfirm
 
+      # --- Signing (conditional on secrets; runs BEFORE packaging so the signed
+      #     + notarized + stapled bundle is what gets zipped) -----------------
+
+      - name: Sign & notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APP_PATH: "dist/Donjon Regen.app"
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::No Developer ID secrets set — ad-hoc signing only."
+            echo "The .app will run on Apple Silicon but is NOT notarized;"
+            echo "users must right-click → Open to bypass Gatekeeper."
+            codesign --force --deep --sign - "$APP_PATH"
+            exit 0
+          fi
+
+          # Import the Developer ID cert into a throwaway keychain.
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Make the keychain searchable for codesign without dropping the login one.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          # Sign inner-out with the hardened runtime + entitlements.
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements entitlements.plist \
+            --sign "$MACOS_SIGN_IDENTITY" "$APP_PATH"
+          codesign --verify --strict --verbose=2 "$APP_PATH"
+
+          # Notarize: submit a zip of the .app, wait for the verdict, then
+          # staple the ticket onto the on-disk bundle.
+          ditto -c -k --keepParent "$APP_PATH" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notarize.zip"
+
+      - name: Sign (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $exe = "dist/Donjon Regen/Donjon Regen.exe"
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERT_PFX_BASE64)) {
+            Write-Host "::warning::No code-signing cert set — shipping unsigned."
+            Write-Host "Users must click 'More info -> Run anyway' past SmartScreen."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          # Pick the newest x64 signtool from the installed Windows SDK.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+              -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
+          & $signtool sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 $exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+          & $signtool verify /pa $exe
+          Remove-Item $pfx
+
+      # --- Packaging + checksums -------------------------------------------
+
       # Zip the bundle so the artifact preserves the .app bundle structure /
       # the one-dir layout. ditto keeps macOS resource forks + symlinks intact.
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/Donjon Regen.app" "${{ matrix.artifact }}.zip"
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent "dist/Donjon Regen.app" "${{ matrix.artifact }}.zip"
+          shasum -a 256 "${{ matrix.artifact }}.zip" > "${{ matrix.artifact }}.zip.sha256"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path "dist/Donjon Regen" -DestinationPath "${{ matrix.artifact }}.zip"
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/Donjon Regen" -DestinationPath "${{ matrix.artifact }}.zip"
+          $hash = (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii -NoNewline "${{ matrix.artifact }}.zip.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.zip
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
           if-no-files-found: error
 
   release:
@@ -80,5 +188,7 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/*.zip.sha256
           generate_release_notes: true

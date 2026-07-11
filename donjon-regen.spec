@@ -18,6 +18,11 @@ Notes
   PySide6 hook — keep ``datas``/``binaries`` empty unless that stops working.
 * one-dir layout (COLLECT) is used rather than one-file: Qt apps start faster
   and unpack more reliably this way.
+* Code signing is done in CI AFTER the build (see .github/workflows/build.yml),
+  not here: the macOS .app is Developer-ID-signed with the hardened runtime +
+  ``entitlements.plist`` then notarized/stapled, and the Windows .exe is
+  Authenticode-signed — all gated on repo secrets. Hence ``codesign_identity``
+  stays ``None`` in the spec (a local ``pyinstaller`` build is left unsigned).
 """
 
 APP_NAME = "Donjon Regen"

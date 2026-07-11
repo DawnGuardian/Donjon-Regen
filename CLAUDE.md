@@ -26,6 +26,7 @@ Donjon-Regen/           # Project root — all source lives here
     up.png
     down.png
   donjon-regen.spec     # PyInstaller build spec (targets app.py)
+  entitlements.plist    # macOS hardened-runtime entitlements (used by CI signing)
   .github/workflows/    # CI — build.yml freezes the macOS .app + Windows .exe
   test-data/            # Reference test files (deletable/replaceable; NOT committed)
   renders/              # Generated output files (default output directory; NOT committed)
@@ -67,9 +68,24 @@ bundles no data files — door/stair glyphs are procedural and label fonts
 resolve from the host OS (`renderer._LABEL_FONT_CANDIDATES` now lists
 macOS/Windows/Linux paths plus bare-name lookups for frozen builds). Builds are
 per-OS (no cross-compile); `.github/workflows/build.yml` builds the macOS `.app`
-and Windows `.exe` on hosted runners and publishes them to a GitHub Release on
-`v*` tags. Bundles are unsigned (Gatekeeper/SmartScreen warnings until
-signed/notarized).
+and Windows `.exe` on hosted runners and publishes them (plus `.sha256`
+checksums) to a GitHub Release on `v*` tags.
+
+Code signing is **conditional on repo secrets** and happens in CI *after* the
+build (not in the spec — `codesign_identity` stays `None`). When the macOS
+secrets are set (`MACOS_CERT_P12_BASE64` / `_CERT_PASSWORD` / `_SIGN_IDENTITY` /
+`_NOTARY_APPLE_ID` / `_NOTARY_PASSWORD` / `_NOTARY_TEAM_ID`) the `.app` is
+Developer-ID-signed with the hardened runtime + `entitlements.plist`, then
+notarized via `notarytool` and stapled; otherwise it gets an ad-hoc signature
+(so Apple Silicon can launch it) and stays un-notarized. When the Windows
+secrets are set (`WINDOWS_CERT_PFX_BASE64` / `_CERT_PASSWORD`) the `.exe` is
+Authenticode-signed with `signtool`; otherwise it ships unsigned. The signing
+steps slot between build and packaging so the signed/stapled bundle is what
+gets zipped. `entitlements.plist` disables library-validation + allows JIT /
+unsigned-exec-memory / dyld env vars — the minimal set a frozen PyInstaller +
+CPython + Qt app needs under the hardened runtime. Unsigned bundles trip
+Gatekeeper / SmartScreen; the README User Guide documents the right-click→Open
+and "More info → Run anyway" bypasses.
 
 The GUI is the primary workflow; the CLI remains available for headless
 rendering and scripted batch jobs.
@@ -111,12 +127,12 @@ Pure mutations on the in-memory dungeon dict. Each op keeps invariants consisten
 - **`mirror_rooms(d, axis, pivot, source_side)`** — one-shot mirror in overwrite mode. `axis` is `"horizontal"` (rows mirror across pivot row) or `"vertical"` (cols mirror across pivot col); `source_side` picks the source half (`"north"/"south"` or `"west"/"east"`). For each source room: computes the mirrored bbox, deletes any destination rooms overlapping it (overwrite), then creates a fresh room at the mirrored coords with new id, deep-copied contents, and mirrored doors (door-type bits painted on the destination cells). Corridors and stairs are NOT mirrored. Rooms straddling the pivot are skipped. Source rooms whose mirrored bbox would fall off the canvas are silently skipped and listed in the return value (`skipped_off_canvas`).
 - **Details panel** — `QStackedWidget` with two pages: page 0 = simple read-only `QLabel`+`QTextEdit` (corridors, doors, wall/wandering); page 1 = `Room_Editor`.
 - **Click resolution** — based on the cell bitmask: room → `Room_Editor` for `rooms[id]`; corridor → `corridor_features[label_char]` if marked, else "Plain corridor"; door → door type; wall/empty → the dungeon's `wandering_monsters` d6 table.
-- **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker`) so the UI stays responsive.
+- **Save Outputs** runs `generate_dungeon` on a `QThread` worker (`Save_Worker(dungeon, out_dir, render_scale, force, parent)`) so the UI stays responsive. Before starting the worker, `_save_outputs` calls `generate.existing_outputs` on the chosen directory and, if anything would be clobbered, shows a `QMessageBox.warning(Yes|No)` listing the filenames; declining cancels the save. Once past that gate the worker is always passed `force=True` (the user has confirmed, or there was nothing to confirm).
 - **PIL → Qt bridge** — `pil_to_qpixmap` round-trips through PNG bytes (`PIL.Image.save → QImage.fromData → QPixmap.fromImage`). Avoids subtle stride/format issues with `frombytes`.
 
 ### Room editor
 
-Structured form built from the room dict. Edits live in the in-memory dungeon and are flushed by **Apply Changes**; saving to disk is still done via Save Outputs.
+Structured form built from the room dict. Edits live in the in-memory dungeon and are flushed by **Apply Changes**; saving to disk is still done via Save Outputs (which now writes the edited dungeon back out as `<name>.json` alongside the rendered artifacts, so edits round-trip).
 
 - **Geometry section** — at the top: Shape combo (Rectangle / Polygon / Circle), Polygon-N spinbox (visible only when shape=Polygon), and four signed perimeter Δ spinboxes (N / S / W / E). On Apply, `dungeon_ops.resize_room` runs first, then `dungeon_ops.reshape_room` — so a user can grow a non-square room to square *and* convert it to polygon/circle in one Apply. Either op surfaces validation failures (off-canvas / overlap / non-square polymorph) via `QMessageBox.warning` and leaves the room dict untouched on failure.
 - **Delete Room button** (bottom-left of the editor) — emits `delete_clicked`. The main window confirms via `QMessageBox.warning(Yes|No)` and dispatches `dungeon_ops.delete_room`; on success the details panel returns to the simple-view page.
@@ -185,6 +201,19 @@ When no padding exists (cells size == n_rows × n_cols), offset is 0.
   - **Pass 2** redraws every internal bbox grid edge, then reverts any `GRID_COLOR` pixel where the pre-grid snapshot was non-WHITE. Pixels outside the polygon shape were BLACK in the snapshot and revert; pixels over the polygon interior or over connector cells were WHITE and survive. The snapshot is captured BEFORE Pass 1 runs so rogue Pass-1 stubs along bbox boundaries get reverted too.
 - **Wall lines vs grid lines**: One color (`GRID_COLOR` = 204) on every cell-edge that touches an open cell — open/open and open/closed boundaries alike. There is no separate `WALL_COLOR` line at room/perimeter boundaries; walls are simply the black background showing through where no open cell exists on either side. `WALL_COLOR` is kept defined in code as a legacy reference but is no longer drawn anywhere.
 - **Doors**: Drawn procedurally at the target `cell_size` by `gen_assets.door_symbol_rgba(name, cell_size)` — pure integer drawing, no resampling, no anti-aliasing — so straight lines stay straight and pixel features stay crisp at any size. Thin interior strokes (door panel outline, S-glyph segments, locked/trapped/portcullis bars) scale linearly from 1px at the 19×19 reference via `_stroke(size) = round(size/19)`, with centered strokes rounded up to odd via `_odd_at_least` for pixel-symmetric centering. This keeps stub-to-stroke proportions matched to the reference instead of degrading to hairlines at large `cell_size`. The renderer caches RGBA glyphs by `(name, cell_size, orient)` and rotates 90° clockwise for horizontal walls. (Earlier versions loaded the static 19×19 PNGs from `assets/` and LANCZOS-scaled them; the resampling produced uneven thickness and gray ringing on what should be straight lines, so PNG-load + scale was replaced with procedural generation.) The `assets/` PNGs are still produced by `gen_assets.py main()` as a canonical 19×19 reference.
+
+## Generation & Overwrite Policy (`generate.py`)
+
+`generate_dungeon(dungeon, output_dir, render_scale, on_progress, force=False)` writes **six** files, all named from `settings.name`:
+
+1. `<name>.json` — the dungeon dict itself, `json.dump` with `separators=(",", ":")` (compact, like donjon's own export). Written **first**, because it's the only artifact that can't be regenerated from the others, so it survives a later rendering failure. This is what makes editor changes round-trip: reopening it restores corridors, rooms, and room contents, and re-rendering from it is byte-identical.
+2. GM PNG, 3. player PNG, 4. HTML, 5. TSV, 6. CSV.
+
+- **`output_paths(dungeon, output_dir)`** — the six paths in write order. Depends only on `settings`, never on `render_scale`, so it's safe to call before rendering. `generate_dungeon` unpacks this same list, which keeps the two from drifting.
+- **`existing_outputs(dungeon, output_dir)`** — the subset already on disk.
+- **`Output_Overwrite_Conflict(Exception)`** — carries `.paths`. Raised by `generate_dungeon` when any target exists and `force` is False. Pre-flighted **before `mkdir` and before any write**, so a refusal leaves the disk untouched. Mirrors the `Canvas_Resize_Conflict` / `force=True` pattern in `dungeon_ops`.
+
+Because outputs are named from `settings.name`, saving into the directory the source `.json` was loaded from **overwrites that source** — this is intended (an editor's "save" writes back), but it is always confirmed first. The CLI (`regen.py`) catches the conflict, lists the paths, and prompts `Overwrite? [y/N]` via `_confirm_overwrite`; when `stdin` is not a TTY it refuses and points at `-f/--force` rather than hanging on `input()`. The GUI confirms via dialog (see Save Outputs above).
 
 ## Tabular Export (`table_gen.py`)
 
