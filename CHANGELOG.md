@@ -9,6 +9,11 @@ This file is generated from the commit history -- do not edit it by hand.
 
 - **generate**: Write the dungeon JSON back out alongside renders
 
+### Build
+
+- Add git-cliff changelog configuration
+- Sync cliff.toml with the canonical copy
+
 ## 1.0.0 - 2026-06-16
 
 ### Features
