@@ -14,6 +14,10 @@ This file is generated from the commit history -- do not edit it by hand.
 - Add git-cliff changelog configuration
 - Sync cliff.toml with the canonical copy
 
+### Miscellaneous
+
+- Add the shared .editorconfig
+
 ## 1.0.0 - 2026-06-16
 
 ### Features
